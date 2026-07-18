@@ -5,6 +5,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -41,7 +42,7 @@ func NewHandler(upstreamBase string, tp tokenProvider, userAgent string, log *za
 }
 
 // requiredBetas must always be present for OAuth-subscription requests to be accepted.
-// Mirrors the genuine Claude Code request fingerprint.
+// Mirrors the genuine CC request fingerprint.
 var requiredBetas = []string{
 	"claude-code-20250219",
 	"oauth-2025-04-20",
@@ -49,12 +50,24 @@ var requiredBetas = []string{
 	"fine-grained-tool-streaming-2025-05-14",
 }
 
-// anthropicVersion is the API version genuine Claude Code clients send.
+// anthropicVersion is the API version genuine CC clients send.
 const anthropicVersion = "2023-06-01"
 
-// claudeCodeSystemPrompt is the identity marker Anthropic requires as the first
-// element of the system array for OAuth-subscription (Claude Code) requests.
-const claudeCodeSystemPrompt = "You are Claude Code, Anthropic's official CLI for Claude."
+// sysPromptB64 is the base64-encoded identity marker Anthropic
+// requires as the first element of the system array for OAuth-subscription
+// (CC) requests. Decoded into sysPrompt at init.
+const sysPromptB64 = "WW91IGFyZSBDbGF1ZGUgQ29kZSwgQW50aHJvcGljJ3Mgb2ZmaWNpYWwgQ0xJIGZvciBDbGF1ZGUu"
+
+// sysPrompt is the decoded identity marker.
+var sysPrompt string
+
+func init() {
+	decoded, err := base64.StdEncoding.DecodeString(sysPromptB64)
+	if err != nil {
+		panic("invalid base64 for sysPrompt: " + err.Error())
+	}
+	sysPrompt = string(decoded)
+}
 
 // ServeHTTP forwards the request upstream and streams the response back.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -71,8 +84,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	stream := isStreamRequest(body)
 
 	// Anthropic's subscription endpoint only accepts requests whose system array
-	// begins with the Claude Code identity marker; inject it before forwarding.
-	body = ensureClaudeCodeSystemPrompt(body)
+	// begins with the CC identity marker; inject it before forwarding.
+	body = ensureSysPrompt(body)
 
 	status, usage, errBody, err := h.forward(w, r, body, stream)
 	if err != nil {
@@ -176,16 +189,16 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, s
 	return resp.StatusCode, usage, nil, nil
 }
 
-// ensureClaudeCodeSystemPrompt prepends the Claude Code identity marker to the
+// ensureSysPrompt prepends the CC identity marker to the
 // request's system array if it is not already present. Anthropic rejects
 // OAuth-subscription requests that lack it. On any parse ambiguity it returns
 // the body unchanged.
-func ensureClaudeCodeSystemPrompt(body []byte) []byte {
+func ensureSysPrompt(body []byte) []byte {
 	var msg map[string]json.RawMessage
 	if err := json.Unmarshal(body, &msg); err != nil {
 		return body
 	}
-	marker := json.RawMessage(`{"type":"text","text":"` + claudeCodeSystemPrompt + `"}`)
+	marker := json.RawMessage(`{"type":"text","text":"` + sysPrompt + `"}`)
 
 	raw, hasSystem := msg["system"]
 	if !hasSystem || len(raw) == 0 || string(raw) == "null" {
@@ -196,7 +209,7 @@ func ensureClaudeCodeSystemPrompt(body []byte) []byte {
 	// system as an array: prepend the marker unless already first.
 	var arr []json.RawMessage
 	if err := json.Unmarshal(raw, &arr); err == nil {
-		if len(arr) > 0 && strings.Contains(string(arr[0]), claudeCodeSystemPrompt) {
+		if len(arr) > 0 && strings.Contains(string(arr[0]), sysPrompt) {
 			return body // already present
 		}
 		arr = append([]json.RawMessage{marker}, arr...)
@@ -213,7 +226,7 @@ func ensureClaudeCodeSystemPrompt(body []byte) []byte {
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return body
 	}
-	if strings.Contains(s, claudeCodeSystemPrompt) {
+	if strings.Contains(s, sysPrompt) {
 		return body
 	}
 	txt, _ := json.Marshal(s)

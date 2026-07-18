@@ -65,7 +65,7 @@ func TestProxy_InjectsHeadersAndStripsClientAuth(t *testing.T) {
 		}
 	}
 	// Claude Code identity marker must be injected into the forwarded body.
-	if !strings.Contains(gotBody, claudeCodeSystemPrompt) {
+	if !strings.Contains(gotBody, sysPrompt) {
 		t.Fatalf("upstream body missing Claude Code system marker: %s", gotBody)
 	}
 }
@@ -102,9 +102,9 @@ func TestEnsureClaudeCodeSystemPrompt(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			out := ensureClaudeCodeSystemPrompt([]byte(tc.in))
+			out := ensureSysPrompt([]byte(tc.in))
 			s := string(out)
-			idx := strings.Index(s, claudeCodeSystemPrompt)
+			idx := strings.Index(s, sysPrompt)
 			if idx < 0 {
 				t.Fatalf("marker not injected: %s", s)
 			}
@@ -125,15 +125,15 @@ func TestEnsureClaudeCodeSystemPrompt(t *testing.T) {
 
 	t.Run("already present", func(t *testing.T) {
 		in := `{"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"messages":[]}`
-		out := ensureClaudeCodeSystemPrompt([]byte(in))
-		if strings.Count(string(out), claudeCodeSystemPrompt) != 1 {
+		out := ensureSysPrompt([]byte(in))
+		if strings.Count(string(out), sysPrompt) != 1 {
 			t.Fatalf("marker duplicated: %s", out)
 		}
 	})
 
 	t.Run("invalid json untouched", func(t *testing.T) {
 		in := `not json`
-		if string(ensureClaudeCodeSystemPrompt([]byte(in))) != in {
+		if string(ensureSysPrompt([]byte(in))) != in {
 			t.Fatalf("invalid json should be returned unchanged")
 		}
 	})
