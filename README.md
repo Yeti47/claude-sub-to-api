@@ -113,12 +113,6 @@ go test ./...
 PROXY_API_KEY=dev-key CREDENTIALS_PATH=~/.claude/.credentials.json go run ./cmd/claude-sub-to-api
 ```
 
-## Scope & limitations
-
-- **Single account.** One credentials file = one subscription.
-- **Full pass-through** of Anthropic request features (thinking, tool use, prompt caching, custom `anthropic-beta` headers).
-- Not included (by design, for a first version): multi-account rotation, rate limiting, per-key usage metering, an OpenAI-compatible endpoint, or a web UI.
-
 ## Disclaimer
 
 **This is an unofficial, community-maintained project.** It is **not** created by, endorsed by, sponsored by, or affiliated with Anthropic PBC or claude.ai in any way. "Claude" and "Anthropic" are trademarks of Anthropic PBC.
