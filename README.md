@@ -121,4 +121,10 @@ PROXY_API_KEY=dev-key CREDENTIALS_PATH=~/.claude/.credentials.json go run ./cmd/
 
 ## Disclaimer
 
-This proxies your personal Claude subscription through Anthropic's OAuth flow. Review Anthropic's terms of service before using it for anything beyond personal, permitted use.
+**This is an unofficial, community-maintained project.** It is **not** created by, endorsed by, sponsored by, or affiliated with Anthropic PBC or claude.ai in any way. "Claude" and "Anthropic" are trademarks of Anthropic PBC.
+
+This project is intended for **small-scale, experimental, and research purposes only** — e.g. prototyping tool integrations, exploring agent architectures, or personal tinkering. It is **not** designed for production workloads, high-throughput usage, or anything that would compete with Anthropic's own API offerings.
+
+This tool proxies your personal Claude subscription through Anthropic's OAuth flow. **We strongly advise you to review and comply with [Anthropic's Terms of Service](https://www.anthropic.com/legal/terms) and [Acceptable Use Policy](https://www.anthropic.com/legal/aup) before using this software.** Use it only for personal, permitted purposes — any usage that violates Anthropic's terms is your own responsibility.
+
+If you need reliable, scalable programmatic access to Claude, you should acquire the appropriate API license directly from Anthropic. See [Anthropic's API plans & pricing](https://www.anthropic.com/pricing) to choose the tier that fits your needs.
