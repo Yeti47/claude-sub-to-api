@@ -1,0 +1,21 @@
+services:
+  proxy:
+    build: .
+    image: claude-sub-to-api:latest
+    container_name: claude-sub-to-api
+    restart: unless-stopped
+    # Run as the host user so the bind-mounted credentials file (owned by you,
+    # mode 0600) stays readable and rewritable across token refreshes.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    ports:
+      - "8080:8080"
+    environment:
+      LISTEN_ADDR: ":8080"
+      UPSTREAM_BASE_URL: "https://api.anthropic.com"
+      PROXY_API_KEY: ${PROXY_API_KEY:?set PROXY_API_KEY in .env}
+      CREDENTIALS_PATH: "/data/.credentials.json"
+      LOG_LEVEL: "info"
+      CLAUDE_UA: "claude-cli/2.1.44"
+    volumes:
+      # Drop your externally-generated .credentials.json into this volume/dir.
+      - ~/.config/claude-sub-to-api:/data

@@ -1,0 +1,28 @@
+# Secrets & environment
+.env
+.env.*
+!.env.example
+
+# Local credentials & data volume (contains OAuth tokens)
+data/
+*.credentials.json
+.credentials.json
+
+# Build artifacts
+/claude-sub-to-api
+*.o
+*.a
+*.test
+*.out
+
+# Go workspace / vendor
+vendor/
+go.work
+go.work.sum
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
