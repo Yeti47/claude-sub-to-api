@@ -43,12 +43,21 @@ func NewHandler(upstreamBase string, tp tokenProvider, userAgent string, log *za
 }
 
 // requiredBetas must always be present for OAuth-subscription requests to be accepted.
-// Mirrors the genuine CC request fingerprint.
+// Mirrors the genuine CC request fingerprint
+//   - claude-code-20250219    : always set for non-Haiku models
+//   - oauth-2025-04-20        : always set for OAuth subscribers
+//   - interleaved-thinking-2025-05-14 : set when model supports ISP (Claude 4+)
+//   - prompt-caching-scope-2026-01-05 : always set for firstParty (1P)
+//   - context-management-2025-06-27   : set for models supporting context mgmt (Claude 4+)
+//
+// NOTE: fine-grained-tool-streaming-2025-05-14 is NOT a beta header — CC uses it
+// as a per-tool eager_input_streaming field, not in anthropic-beta.
 var requiredBetas = []string{
 	"claude-code-20250219",
 	"oauth-2025-04-20",
 	"interleaved-thinking-2025-05-14",
-	"fine-grained-tool-streaming-2025-05-14",
+	"prompt-caching-scope-2026-01-05",
+	"context-management-2025-06-27",
 }
 
 // anthropicVersion is the API version genuine CC clients send.
@@ -153,6 +162,9 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, s
 	req.Header.Set("anthropic-version", anthropicVersion)
 	req.Header.Set("anthropic-beta", mergeBetas(r.Header.Get("anthropic-beta"), requiredBetas))
 
+	// CC's getAnthropicClient always sets x-app: 'cli' as a default header.
+	req.Header.Set("x-app", "cli")
+
 	resp, err := h.client.Do(req)
 	if err != nil {
 		return 0, nil, nil, fmt.Errorf("call upstream: %w", err)
@@ -195,10 +207,19 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, s
 // (OpenAI chat/completions doesn't require it; Anthropic messages does).
 const defaultMaxTokens = 4096
 
+// attributionHeader is the billing/attribution text block CC prepends as the
+// very first element of the system array. The server uses cc_version and
+// cc_entrypoint to identify genuine CC traffic. The fingerprint suffix is a
+// short hash derived from the request's first user message (CC computes a
+// real fingerprint; we send a stable placeholder).
+const attributionHeader = "x-anthropic-billing-header: cc_version=2.1.44.0; cc_entrypoint=cli;"
+
 // ensureCCRequestShape rewrites the request body so it satisfies Anthropic's
 // OAuth-subscription (Claude Code) requirements:
-//   - system is a well-formed array whose first element is the CC identity marker
+//   - system is a well-formed array whose first elements are the CC attribution
+//     header and identity marker
 //   - max_tokens is present and a positive number
+//   - metadata is present with a user_id field
 //
 // Translating gateways (e.g. Bifrost doing OpenAI→Anthropic) frequently drop
 // system, send it as a bare string or unwrapped object, or omit max_tokens.
@@ -217,20 +238,33 @@ func ensureCCRequestShape(body []byte) []byte {
 		msg["max_tokens"] = json.RawMessage(strconv.Itoa(defaultMaxTokens))
 	}
 
+	// CC always sends metadata.user_id as a JSON-stringified object containing
+	// device_id, account_uuid, and session_id. Gateways never set this.
+	if _, ok := msg["metadata"]; !ok {
+		meta := fmt.Sprintf(`{"user_id":%q}`, "claude-sub-to-api-proxy")
+		msg["metadata"] = json.RawMessage(meta)
+	}
+
 	return marshalOrOriginal(msg, body)
 }
 
-// ccSystemArray returns a system array beginning with the CC identity marker,
-// preserving any existing system content after it.
+// ccSystemArray returns a system array beginning with the CC attribution
+// header and identity marker, preserving any existing system content after them.
 func ccSystemArray(raw json.RawMessage) json.RawMessage {
-	marker := `{"type":"text","text":` + mustJSONString(sysPrompt) + `}`
+	attributionBlock := `{"type":"text","text":` + mustJSONString(attributionHeader) + `}`
+	markerBlock := `{"type":"text","text":` + mustJSONString(sysPrompt) + `}`
 
 	var b strings.Builder
 	b.WriteByte('[')
-	b.WriteString(marker)
+	b.WriteString(attributionBlock)
+	b.WriteByte(',')
+	b.WriteString(markerBlock)
 	for _, e := range extractSystemTexts(raw) {
 		if strings.Contains(e, sysPrompt) {
 			continue // marker already present; it stays first, unduplicated
+		}
+		if strings.Contains(e, attributionHeader) {
+			continue // attribution already present; don't duplicate
 		}
 		b.WriteByte(',')
 		b.WriteString(e)
