@@ -138,30 +138,30 @@ func TestEnsureCCRequestShape(t *testing.T) {
 			if err := json.Unmarshal(msg["system"], &arr); err != nil {
 				t.Fatalf("system is not an array of objects: %s", s)
 			}
-		if len(arr) < 2 {
-			t.Fatalf("system array should have at least 2 elements (attribution + marker): %s", s)
-		}
-		// First element must be the attribution header.
-		var first struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		}
-		if err := json.Unmarshal(mustRaw(arr[0]), &first); err != nil {
-			t.Fatalf("first system element not an object: %s", s)
-		}
-		if first.Type != "text" || !strings.HasPrefix(first.Text, "x-anthropic-billing-header:") {
-			t.Fatalf("first system element = %+v, want attribution header", first)
-		}
-		// Second element must be the CC identity marker.
-		var second struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		}
-		if err := json.Unmarshal(mustRaw(arr[1]), &second); err != nil {
-			t.Fatalf("second system element not an object: %s", s)
-		}
-		if second.Type != "text" || second.Text != sysPrompt {
-			t.Fatalf("second system element = %+v, want CC marker", second)
+			if len(arr) < 2 {
+				t.Fatalf("system array should have at least 2 elements (attribution + marker): %s", s)
+			}
+			// First element must be the attribution header.
+			var first struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(mustRaw(arr[0]), &first); err != nil {
+				t.Fatalf("first system element not an object: %s", s)
+			}
+			if first.Type != "text" || !strings.HasPrefix(first.Text, "x-anthropic-billing-header:") {
+				t.Fatalf("first system element = %+v, want attribution header", first)
+			}
+			// Second element must be the CC identity marker.
+			var second struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(mustRaw(arr[1]), &second); err != nil {
+				t.Fatalf("second system element not an object: %s", s)
+			}
+			if second.Type != "text" || second.Text != sysPrompt {
+				t.Fatalf("second system element = %+v, want CC marker", second)
 				t.Fatalf("original system text lost: %s", s)
 			}
 			if strings.Contains(tc.in, "Be terse") && !strings.Contains(s, "Be terse") {
