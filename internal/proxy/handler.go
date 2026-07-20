@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -84,8 +85,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	stream := isStreamRequest(body)
 
 	// Anthropic's subscription endpoint only accepts requests whose system array
-	// begins with the CC identity marker; inject it before forwarding.
-	body = ensureSysPrompt(body)
+	// begins with the CC identity marker and that carry max_tokens; gateways that
+	// translate from OpenAI chat/completions often omit or re-wrap these.
+	body = ensureCCRequestShape(body)
 
 	status, usage, errBody, err := h.forward(w, r, body, stream)
 	if err != nil {
@@ -189,49 +191,127 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, s
 	return resp.StatusCode, usage, nil, nil
 }
 
-// ensureSysPrompt prepends the CC identity marker to the
-// request's system array if it is not already present. Anthropic rejects
-// OAuth-subscription requests that lack it. On any parse ambiguity it returns
-// the body unchanged.
-func ensureSysPrompt(body []byte) []byte {
+// defaultMaxTokens is used when a translating gateway omits max_tokens
+// (OpenAI chat/completions doesn't require it; Anthropic messages does).
+const defaultMaxTokens = 4096
+
+// ensureCCRequestShape rewrites the request body so it satisfies Anthropic's
+// OAuth-subscription (Claude Code) requirements:
+//   - system is a well-formed array whose first element is the CC identity marker
+//   - max_tokens is present and a positive number
+//
+// Translating gateways (e.g. Bifrost doing OpenAI→Anthropic) frequently drop
+// system, send it as a bare string or unwrapped object, or omit max_tokens.
+// Rather than bailing on ambiguity, normalize aggressively and preserve
+// whatever content we can. Anthropic rejects misshapen OAuth-subscription
+// requests with a misleading "third-party apps draw from your extra usage" 400.
+func ensureCCRequestShape(body []byte) []byte {
 	var msg map[string]json.RawMessage
 	if err := json.Unmarshal(body, &msg); err != nil {
-		return body
-	}
-	marker := json.RawMessage(`{"type":"text","text":"` + sysPrompt + `"}`)
-
-	raw, hasSystem := msg["system"]
-	if !hasSystem || len(raw) == 0 || string(raw) == "null" {
-		msg["system"] = json.RawMessage(`[` + string(marker) + `]`)
-		return marshalOrOriginal(msg, body)
+		return body // not a JSON object (e.g. GET with empty body); leave untouched
 	}
 
-	// system as an array: prepend the marker unless already first.
+	msg["system"] = ccSystemArray(msg["system"])
+
+	if raw, ok := msg["max_tokens"]; !ok || !isPositiveNumber(raw) {
+		msg["max_tokens"] = json.RawMessage(strconv.Itoa(defaultMaxTokens))
+	}
+
+	return marshalOrOriginal(msg, body)
+}
+
+// ccSystemArray returns a system array beginning with the CC identity marker,
+// preserving any existing system content after it.
+func ccSystemArray(raw json.RawMessage) json.RawMessage {
+	marker := `{"type":"text","text":` + mustJSONString(sysPrompt) + `}`
+
+	var b strings.Builder
+	b.WriteByte('[')
+	b.WriteString(marker)
+	for _, e := range extractSystemTexts(raw) {
+		if strings.Contains(e, sysPrompt) {
+			continue // marker already present; it stays first, unduplicated
+		}
+		b.WriteByte(',')
+		b.WriteString(e)
+	}
+	b.WriteByte(']')
+	return json.RawMessage(b.String())
+}
+
+// extractSystemTexts normalizes the shapes a `system` field can take into a
+// list of {"type":"text","text":...} element JSON strings. Returns nil when
+// raw is missing, null, or unusable.
+func extractSystemTexts(raw json.RawMessage) []string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+
+	// Array form (Anthropic-native).
 	var arr []json.RawMessage
 	if err := json.Unmarshal(raw, &arr); err == nil {
-		if len(arr) > 0 && strings.Contains(string(arr[0]), sysPrompt) {
-			return body // already present
+		var out []string
+		for _, el := range arr {
+			// Well-formed text blocks pass through untouched.
+			var probe struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(el, &probe); err == nil && probe.Type == "text" && probe.Text != "" {
+				out = append(out, string(el))
+				continue
+			}
+			// Bare string element inside the array.
+			var s string
+			if err := json.Unmarshal(el, &s); err == nil && s != "" {
+				out = append(out, textBlock(s))
+			}
+			// Anything else is not valid as a system element; drop it.
 		}
-		arr = append([]json.RawMessage{marker}, arr...)
-		b, err := json.Marshal(arr)
-		if err != nil {
-			return body
-		}
-		msg["system"] = b
-		return marshalOrOriginal(msg, body)
+		return out
 	}
 
-	// system as a plain string: convert to [marker, original-text].
+	// Plain string form (common from OpenAI→Anthropic translators).
 	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return body
+	if err := json.Unmarshal(raw, &s); err == nil {
+		if s == "" {
+			return nil
+		}
+		return []string{textBlock(s)}
 	}
-	if strings.Contains(s, sysPrompt) {
-		return body
+
+	// Unwrapped single object: {"type":"text","text":"..."}.
+	var probe struct {
+		Text string `json:"text"`
 	}
-	txt, _ := json.Marshal(s)
-	msg["system"] = json.RawMessage(`[` + string(marker) + `,{"type":"text","text":` + string(txt) + `}]`)
-	return marshalOrOriginal(msg, body)
+	if err := json.Unmarshal(raw, &probe); err == nil && probe.Text != "" {
+		return []string{textBlock(probe.Text)}
+	}
+
+	return nil
+}
+
+// textBlock wraps s in an Anthropic text content block.
+func textBlock(s string) string {
+	return `{"type":"text","text":` + mustJSONString(s) + `}`
+}
+
+// isPositiveNumber reports whether raw is a JSON number > 0.
+func isPositiveNumber(raw json.RawMessage) bool {
+	var n float64
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return false
+	}
+	return n > 0
+}
+
+// mustJSONString marshals s as a JSON string.
+func mustJSONString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return `""`
+	}
+	return string(b)
 }
 
 func marshalOrOriginal(msg map[string]json.RawMessage, orig []byte) []byte {

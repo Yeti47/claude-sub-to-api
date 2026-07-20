@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -90,42 +91,81 @@ func TestMergeBetas(t *testing.T) {
 	}
 }
 
-func TestEnsureClaudeCodeSystemPrompt(t *testing.T) {
+func TestEnsureCCRequestShape(t *testing.T) {
 	cases := []struct {
 		name string
 		in   string
 	}{
 		{"no system field", `{"model":"m","messages":[]}`},
+		{"system null", `{"system":null,"messages":[]}`},
 		{"system as string", `{"system":"You are a helpful assistant.","messages":[]}`},
 		{"system as array", `{"system":[{"type":"text","text":"Be terse."}],"messages":[]}`},
+		{"system as bare string in array", `{"system":["Be terse."],"messages":[]}`},
+		{"system as unwrapped object", `{"system":{"type":"text","text":"Be terse."},"messages":[]}`},
 		{"empty array", `{"system":[],"messages":[]}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			out := ensureSysPrompt([]byte(tc.in))
+			out := ensureCCRequestShape([]byte(tc.in))
 			s := string(out)
-			idx := strings.Index(s, sysPrompt)
-			if idx < 0 {
-				t.Fatalf("marker not injected: %s", s)
+
+			// Marker must be present and be the first element of the system array.
+			var msg map[string]json.RawMessage
+			if err := json.Unmarshal(out, &msg); err != nil {
+				t.Fatalf("output is not valid JSON: %v: %s", err, s)
 			}
-			// Marker must be the first text of the system array.
-			sysIdx := strings.Index(s, `"system"`)
-			if sysIdx < 0 || idx < sysIdx {
-				t.Fatalf("marker not within system array: %s", s)
+			var arr []map[string]json.RawMessage
+			if err := json.Unmarshal(msg["system"], &arr); err != nil {
+				t.Fatalf("system is not an array of objects: %s", s)
 			}
-			// Original content preserved.
+			if len(arr) == 0 {
+				t.Fatalf("system array empty: %s", s)
+			}
+			var first struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(mustRaw(arr[0]), &first); err != nil {
+				t.Fatalf("first system element not an object: %s", s)
+			}
+			if first.Type != "text" || first.Text != sysPrompt {
+				t.Fatalf("first system element = %+v, want CC marker", first)
+			}
+
+			// Original content preserved somewhere after the marker.
 			if strings.Contains(tc.in, "helpful assistant") && !strings.Contains(s, "helpful assistant") {
 				t.Fatalf("original system text lost: %s", s)
 			}
 			if strings.Contains(tc.in, "Be terse") && !strings.Contains(s, "Be terse") {
 				t.Fatalf("original system entry lost: %s", s)
 			}
+
+			// max_tokens defaulted when absent.
+			if !strings.Contains(tc.in, "max_tokens") && !strings.Contains(s, `"max_tokens"`) {
+				t.Fatalf("max_tokens not defaulted: %s", s)
+			}
 		})
 	}
 
+	t.Run("max_tokens preserved", func(t *testing.T) {
+		in := `{"model":"m","max_tokens":1024,"messages":[]}`
+		out := ensureCCRequestShape([]byte(in))
+		if !strings.Contains(string(out), `"max_tokens":1024`) {
+			t.Fatalf("max_tokens overwritten: %s", out)
+		}
+	})
+
+	t.Run("max_tokens null replaced", func(t *testing.T) {
+		in := `{"model":"m","max_tokens":null,"messages":[]}`
+		out := ensureCCRequestShape([]byte(in))
+		if strings.Contains(string(out), `"max_tokens":null`) {
+			t.Fatalf("max_tokens left null: %s", out)
+		}
+	})
+
 	t.Run("already present", func(t *testing.T) {
 		in := `{"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"messages":[]}`
-		out := ensureSysPrompt([]byte(in))
+		out := ensureCCRequestShape([]byte(in))
 		if strings.Count(string(out), sysPrompt) != 1 {
 			t.Fatalf("marker duplicated: %s", out)
 		}
@@ -133,10 +173,19 @@ func TestEnsureClaudeCodeSystemPrompt(t *testing.T) {
 
 	t.Run("invalid json untouched", func(t *testing.T) {
 		in := `not json`
-		if string(ensureSysPrompt([]byte(in))) != in {
+		if string(ensureCCRequestShape([]byte(in))) != in {
 			t.Fatalf("invalid json should be returned unchanged")
 		}
 	})
+}
+
+// mustRaw re-marshals a decoded map element back to raw JSON for further decoding.
+func mustRaw(v map[string]json.RawMessage) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	return b
 }
 
 func TestIsStreamRequest(t *testing.T) {
