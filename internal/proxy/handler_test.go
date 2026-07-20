@@ -63,28 +63,15 @@ func TestProxy_InjectsHeadersAndStripsClientAuth(t *testing.T) {
 	}
 	// Required betas plus the client's passthrough beta, de-duplicated.
 	for _, want := range []string{"oauth-2025-04-20", "claude-code-20250219",
-		"interleaved-thinking-2025-05-14", "prompt-caching-scope-2026-01-05",
-		"context-management-2025-06-27",
+		"interleaved-thinking-2025-05-14", "fine-grained-tool-streaming-2025-05-14",
 		"prompt-caching-2024-07-31"} {
 		if !strings.Contains(gotBeta, want) {
 			t.Fatalf("anthropic-beta missing %q: %q", want, gotBeta)
 		}
 	}
-	// fine-grained-tool-streaming is NOT a beta header (it's a per-tool field).
-	if strings.Contains(gotBeta, "fine-grained-tool-streaming") {
-		t.Fatalf("fine-grained-tool-streaming should not be in anthropic-beta: %q", gotBeta)
-	}
 	// Claude Code identity marker must be injected into the forwarded body.
 	if !strings.Contains(gotBody, sysPrompt) {
 		t.Fatalf("upstream body missing Claude Code system marker: %s", gotBody)
-	}
-	// Attribution header must be injected as first system block.
-	if !strings.Contains(gotBody, attributionHeader) {
-		t.Fatalf("upstream body missing attribution header: %s", gotBody)
-	}
-	// metadata must be injected.
-	if !strings.Contains(gotBody, `"metadata"`) {
-		t.Fatalf("upstream body missing metadata: %s", gotBody)
 	}
 }
 
@@ -101,13 +88,10 @@ func TestMergeBetas(t *testing.T) {
 	if seen["foo-1"] != 1 || seen["claude-code-20250219"] != 1 {
 		t.Fatalf("missing beta entries in %q", got)
 	}
-	for _, b := range []string{"interleaved-thinking-2025-05-14", "prompt-caching-scope-2026-01-05", "context-management-2025-06-27"} {
+	for _, b := range []string{"interleaved-thinking-2025-05-14", "fine-grained-tool-streaming-2025-05-14"} {
 		if seen[b] != 1 {
 			t.Fatalf("missing required beta %q in %q", b, got)
 		}
-	}
-	if seen["fine-grained-tool-streaming-2025-05-14"] != 0 {
-		t.Fatalf("fine-grained-tool-streaming should not be in betas: %q", got)
 	}
 }
 
@@ -138,10 +122,9 @@ func TestEnsureCCRequestShape(t *testing.T) {
 			if err := json.Unmarshal(msg["system"], &arr); err != nil {
 				t.Fatalf("system is not an array of objects: %s", s)
 			}
-			if len(arr) < 2 {
-				t.Fatalf("system array should have at least 2 elements (attribution + marker): %s", s)
+			if len(arr) == 0 {
+				t.Fatalf("system array empty: %s", s)
 			}
-			// First element must be the attribution header.
 			var first struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
@@ -149,20 +132,8 @@ func TestEnsureCCRequestShape(t *testing.T) {
 			if err := json.Unmarshal(mustRaw(arr[0]), &first); err != nil {
 				t.Fatalf("first system element not an object: %s", s)
 			}
-			if first.Type != "text" || !strings.HasPrefix(first.Text, "x-anthropic-billing-header:") {
-				t.Fatalf("first system element = %+v, want attribution header", first)
-			}
-			// Second element must be the CC identity marker.
-			var second struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			}
-			if err := json.Unmarshal(mustRaw(arr[1]), &second); err != nil {
-				t.Fatalf("second system element not an object: %s", s)
-			}
-			if second.Type != "text" || second.Text != sysPrompt {
-				t.Fatalf("second system element = %+v, want CC marker", second)
-				t.Fatalf("original system text lost: %s", s)
+			if first.Type != "text" || first.Text != sysPrompt {
+				t.Fatalf("first system element = %+v, want CC marker", first)
 			}
 			if strings.Contains(tc.in, "Be terse") && !strings.Contains(s, "Be terse") {
 				t.Fatalf("original system entry lost: %s", s)
@@ -196,9 +167,6 @@ func TestEnsureCCRequestShape(t *testing.T) {
 		out := ensureCCRequestShape([]byte(in))
 		if strings.Count(string(out), sysPrompt) != 1 {
 			t.Fatalf("marker duplicated: %s", out)
-		}
-		if strings.Count(string(out), attributionHeader) != 1 {
-			t.Fatalf("attribution header duplicated or missing: %s", out)
 		}
 	})
 

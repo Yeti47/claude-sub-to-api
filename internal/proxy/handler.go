@@ -56,8 +56,7 @@ var requiredBetas = []string{
 	"claude-code-20250219",
 	"oauth-2025-04-20",
 	"interleaved-thinking-2025-05-14",
-	"prompt-caching-scope-2026-01-05",
-	"context-management-2025-06-27",
+	"fine-grained-tool-streaming-2025-05-14",
 }
 
 // anthropicVersion is the API version genuine CC clients send.
@@ -207,19 +206,10 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, s
 // (OpenAI chat/completions doesn't require it; Anthropic messages does).
 const defaultMaxTokens = 4096
 
-// attributionHeader is the billing/attribution text block CC prepends as the
-// very first element of the system array. The server uses cc_version and
-// cc_entrypoint to identify genuine CC traffic. The fingerprint suffix is a
-// short hash derived from the request's first user message (CC computes a
-// real fingerprint; we send a stable placeholder).
-const attributionHeader = "x-anthropic-billing-header: cc_version=2.1.44.0; cc_entrypoint=cli;"
-
 // ensureCCRequestShape rewrites the request body so it satisfies Anthropic's
 // OAuth-subscription (Claude Code) requirements:
-//   - system is a well-formed array whose first elements are the CC attribution
-//     header and identity marker
+//   - system is a well-formed array whose first element is the CC identity marker
 //   - max_tokens is present and a positive number
-//   - metadata is present with a user_id field
 //
 // Translating gateways (e.g. Bifrost doing OpenAI→Anthropic) frequently drop
 // system, send it as a bare string or unwrapped object, or omit max_tokens.
@@ -238,33 +228,20 @@ func ensureCCRequestShape(body []byte) []byte {
 		msg["max_tokens"] = json.RawMessage(strconv.Itoa(defaultMaxTokens))
 	}
 
-	// CC always sends metadata.user_id as a JSON-stringified object containing
-	// device_id, account_uuid, and session_id. Gateways never set this.
-	if _, ok := msg["metadata"]; !ok {
-		meta := fmt.Sprintf(`{"user_id":%q}`, "claude-sub-to-api-proxy")
-		msg["metadata"] = json.RawMessage(meta)
-	}
-
 	return marshalOrOriginal(msg, body)
 }
 
-// ccSystemArray returns a system array beginning with the CC attribution
-// header and identity marker, preserving any existing system content after them.
+// ccSystemArray returns a system array beginning with the CC identity marker,
+// preserving any existing system content after it.
 func ccSystemArray(raw json.RawMessage) json.RawMessage {
-	attributionBlock := `{"type":"text","text":` + mustJSONString(attributionHeader) + `}`
 	markerBlock := `{"type":"text","text":` + mustJSONString(sysPrompt) + `}`
 
 	var b strings.Builder
 	b.WriteByte('[')
-	b.WriteString(attributionBlock)
-	b.WriteByte(',')
 	b.WriteString(markerBlock)
 	for _, e := range extractSystemTexts(raw) {
 		if strings.Contains(e, sysPrompt) {
 			continue // marker already present; it stays first, unduplicated
-		}
-		if strings.Contains(e, attributionHeader) {
-			continue // attribution already present; don't duplicate
 		}
 		b.WriteByte(',')
 		b.WriteString(e)
