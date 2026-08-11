@@ -113,6 +113,30 @@ go test ./...
 PROXY_API_KEY=dev-key CREDENTIALS_PATH=~/.claude/.credentials.json go run ./cmd/claude-sub-to-api
 ```
 
+## Integration tests (Bifrost gateway)
+
+There's an end-to-end integration test that runs the proxy against a real
+[Bifrost](https://github.com/maximhq/bifrost) gateway (in Docker) that is
+configured to use the proxy as its Anthropic provider, with a **virtual key**
+(governance) — mirroring a real Bifrost harness setup. It exercises both the
+unified OpenAI-compatible surface (`/v1/chat/completions` with
+`anthropic/<model>`) and the native Anthropic surface
+(`/anthropic/v1/messages`).
+
+Each surface is tested in **non-streaming** and **streaming** (`stream: true`)
+modes, so SSE forwarding is covered end to end.
+
+Prerequisites: `docker`, and your Claude subscription credentials file. The
+test skips itself if either is missing.
+
+```bash
+CLAUDE_CREDENTIALS_PATH=~/.config/claude-sub-to-api/.credentials.json \
+  go test -tags integration ./internal/proxy -run TestBifrostIntegration -v -timeout 20m
+```
+
+The test pulls `maximhq/bifrost:latest` on first run and downloads the model
+catalog, so the first run can take a few minutes; subsequent runs are faster.
+
 ## Disclaimer
 
 **This is an unofficial, community-maintained project.** It is **not** created by, endorsed by, sponsored by, or affiliated with Anthropic PBC or claude.ai in any way. "Claude" and "Anthropic" are trademarks of Anthropic PBC.
