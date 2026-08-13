@@ -5,6 +5,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -93,9 +94,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	stream := isStreamRequest(body)
 
 	// Anthropic's subscription endpoint only accepts requests whose system array
-	// begins with the CC identity marker and that carry max_tokens; gateways that
+	// begins with the CC identity marker, that carry max_tokens, and whose
+	// metadata matches the Claude Code session fingerprint; gateways that
 	// translate from OpenAI chat/completions often omit or re-wrap these.
-	body = ensureCCRequestShape(body)
+	sessionID := sessionIDHeader(r)
+	if sessionID != "" {
+		h.log.Debug("request carries session id", zap.String("session_id", sessionID))
+	}
+	body = ensureCCRequestShape(body, sessionID)
 
 	status, usage, errBody, err := h.forward(w, r, body, stream)
 	if err != nil {
@@ -206,17 +212,28 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, body []byte, s
 // (OpenAI chat/completions doesn't require it; Anthropic messages does).
 const defaultMaxTokens = 4096
 
+// ccDeviceID is a synthetic, stable device identifier used only when a client
+// supplies no metadata of its own. It deliberately contains no real identity.
+const ccDeviceID = "00000000-0000-4000-8000-0000000000cc"
+
 // ensureCCRequestShape rewrites the request body so it satisfies Anthropic's
 // OAuth-subscription (Claude Code) requirements:
 //   - system is a well-formed array whose first element is the CC identity marker
 //   - max_tokens is present and a positive number
+//   - metadata carries a CC-faithful user_id (device_id/account_uuid/session_id)
+//     unless the caller already supplied one (then it is preserved verbatim)
 //
 // Translating gateways (e.g. Bifrost doing OpenAI→Anthropic) frequently drop
-// system, send it as a bare string or unwrapped object, or omit max_tokens.
-// Rather than bailing on ambiguity, normalize aggressively and preserve
-// whatever content we can. Anthropic rejects misshapen OAuth-subscription
-// requests with a misleading "third-party apps draw from your extra usage" 400.
-func ensureCCRequestShape(body []byte) []byte {
+// system, send it as a bare string or unwrapped object, or omit max_tokens and
+// metadata. Rather than bailing on ambiguity, normalize aggressively and
+// preserve whatever content we can. Anthropic rejects misshapen
+// OAuth-subscription requests with a misleading "third-party apps draw from
+// your extra usage" 400.
+//
+// sessionID, when non-empty, is pinned into the synthesized metadata so the
+// same session_id is sent on every turn of a conversation (faithful to CC's
+// getAPIMetadata(), which keeps session_id stable via getSessionId()).
+func ensureCCRequestShape(body []byte, sessionID string) []byte {
 	var msg map[string]json.RawMessage
 	if err := json.Unmarshal(body, &msg); err != nil {
 		return body // not a JSON object (e.g. GET with empty body); leave untouched
@@ -228,7 +245,67 @@ func ensureCCRequestShape(body []byte) []byte {
 		msg["max_tokens"] = json.RawMessage(strconv.Itoa(defaultMaxTokens))
 	}
 
+	msg["metadata"] = ccMetadata(msg["metadata"], sessionID)
+
 	return marshalOrOriginal(msg, body)
+}
+
+// sessionIDHeader extracts the caller's session correlation id, if any.
+// Bifrost forwards this header; it is stable across turns of a conversation,
+// which is exactly what Claude Code relies on to keep correlation intact.
+func sessionIDHeader(r *http.Request) string {
+	return strings.TrimSpace(r.Header.Get("x-bf-session-id"))
+}
+
+// ccMetadata returns the metadata field to send upstream, mirroring Claude
+// Code's getAPIMetadata(): metadata.user_id is a JSON-encoded string of
+// {device_id, account_uuid, session_id}.
+//
+// If the caller already supplied metadata (their own user_id/session_id), it
+// is preserved verbatim so conversation correlation survives multi-turn.
+// Otherwise a CC-faithful block is synthesized; session_id is the value the
+// client pinned via x-bf-session-id (stable across turns), or a random UUID.
+func ccMetadata(raw json.RawMessage, sessionID string) json.RawMessage {
+	if len(raw) > 0 && string(raw) != "null" {
+		return raw // caller-provided metadata wins
+	}
+	if sessionID == "" {
+		sessionID = randomUUID()
+	}
+	uid := ccUserID(ccDeviceID, sessionID)
+	b, err := json.Marshal(map[string]string{"user_id": uid})
+	if err != nil {
+		return raw
+	}
+	return json.RawMessage(b)
+}
+
+// ccUserID renders the user_id value CC puts inside metadata: a JSON-encoded
+// string of the session fields. account_uuid is empty, exactly as CC sends it
+// when no OAuth account info is available (getAPIMetadata uses
+// getOauthAccountInfo()?.accountUuid ?? ”).
+func ccUserID(deviceID, sessionID string) string {
+	b, err := json.Marshal(map[string]string{
+		"device_id":    deviceID,
+		"account_uuid": "",
+		"session_id":   sessionID,
+	})
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// randomUUID returns a random version-4 UUID, used for the session_id when the
+// caller did not pin one.
+func randomUUID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("synthetic-%d", time.Now().UnixNano())
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // ccSystemArray returns a system array beginning with the CC identity marker,

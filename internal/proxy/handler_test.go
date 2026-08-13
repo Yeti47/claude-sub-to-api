@@ -110,7 +110,7 @@ func TestEnsureCCRequestShape(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			out := ensureCCRequestShape([]byte(tc.in))
+			out := ensureCCRequestShape([]byte(tc.in), "")
 			s := string(out)
 
 			// Marker must be present and be the first element of the system array.
@@ -143,12 +143,28 @@ func TestEnsureCCRequestShape(t *testing.T) {
 			if !strings.Contains(tc.in, "max_tokens") && !strings.Contains(s, `"max_tokens"`) {
 				t.Fatalf("max_tokens not defaulted: %s", s)
 			}
+
+			// CC-faithful metadata.user_id synthesized when the caller sent none.
+			var meta struct {
+				UserID string `json:"user_id"`
+			}
+			if err := json.Unmarshal(msg["metadata"], &meta); err != nil || meta.UserID == "" {
+				t.Fatalf("metadata.user_id missing or invalid: %s", s)
+			}
+			// user_id must itself be a JSON-encoded string of session fields.
+			var inner map[string]string
+			if err := json.Unmarshal([]byte(meta.UserID), &inner); err != nil {
+				t.Fatalf("metadata.user_id is not a JSON string of fields: %v: %s", err, s)
+			}
+			if inner["session_id"] == "" || inner["device_id"] == "" {
+				t.Fatalf("metadata.user_id missing session_id/device_id: %+v", inner)
+			}
 		})
 	}
 
 	t.Run("max_tokens preserved", func(t *testing.T) {
 		in := `{"model":"m","max_tokens":1024,"messages":[]}`
-		out := ensureCCRequestShape([]byte(in))
+		out := ensureCCRequestShape([]byte(in), "")
 		if !strings.Contains(string(out), `"max_tokens":1024`) {
 			t.Fatalf("max_tokens overwritten: %s", out)
 		}
@@ -156,7 +172,7 @@ func TestEnsureCCRequestShape(t *testing.T) {
 
 	t.Run("max_tokens null replaced", func(t *testing.T) {
 		in := `{"model":"m","max_tokens":null,"messages":[]}`
-		out := ensureCCRequestShape([]byte(in))
+		out := ensureCCRequestShape([]byte(in), "")
 		if strings.Contains(string(out), `"max_tokens":null`) {
 			t.Fatalf("max_tokens left null: %s", out)
 		}
@@ -164,15 +180,44 @@ func TestEnsureCCRequestShape(t *testing.T) {
 
 	t.Run("already present", func(t *testing.T) {
 		in := `{"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"messages":[]}`
-		out := ensureCCRequestShape([]byte(in))
+		out := ensureCCRequestShape([]byte(in), "")
 		if strings.Count(string(out), sysPrompt) != 1 {
 			t.Fatalf("marker duplicated: %s", out)
 		}
 	})
 
+	t.Run("metadata preserved when caller supplies it", func(t *testing.T) {
+		in := `{"model":"m","metadata":{"user_id":"{\"session_id\":\"client-session-1\",\"device_id\":\"client-dev\"}"},"messages":[]}`
+		out := ensureCCRequestShape([]byte(in), "ignored-header")
+		if !strings.Contains(string(out), "client-session-1") || !strings.Contains(string(out), "client-dev") {
+			t.Fatalf("caller metadata not preserved verbatim: %s", out)
+		}
+		if strings.Contains(string(out), "ignored-header") {
+			t.Fatalf("synthesized session id leaked into preserved metadata: %s", out)
+		}
+	})
+
+	t.Run("session id from header used when no metadata", func(t *testing.T) {
+		in := `{"model":"m","messages":[]}`
+		out := ensureCCRequestShape([]byte(in), "sess-abc-123")
+		var msg map[string]json.RawMessage
+		if err := json.Unmarshal(out, &msg); err != nil {
+			t.Fatal(err)
+		}
+		var meta struct {
+			UserID string `json:"user_id"`
+		}
+		if err := json.Unmarshal(msg["metadata"], &meta); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(meta.UserID, "sess-abc-123") {
+			t.Fatalf("pinned session id not used in metadata.user_id: %s", out)
+		}
+	})
+
 	t.Run("invalid json untouched", func(t *testing.T) {
 		in := `not json`
-		if string(ensureCCRequestShape([]byte(in))) != in {
+		if string(ensureCCRequestShape([]byte(in), "")) != in {
 			t.Fatalf("invalid json should be returned unchanged")
 		}
 	})

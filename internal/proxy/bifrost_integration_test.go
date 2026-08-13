@@ -748,6 +748,86 @@ func TestBifrostIntegration(t *testing.T) {
 		}
 		t.Logf("OK: got completion with %d-byte first-user prompt (%d bytes out)", len(huge), len(resp.Choices[0].Message.Content))
 	})
+
+	t.Run("openai_chat_completions_multi_turn", func(t *testing.T) {
+		// Verifies conversation context survives multi-turn through
+		// Bifrost -> proxy -> Anthropic. The proxy is stateless: each turn must
+		// carry the full history, and the assistant's previous reply must reach
+		// the upstream untouched so the model can reference it.
+		//
+		// We pin a stable session id via x-bf-session-id on BOTH turns. This is
+		// faithful to Claude Code, which keeps a stable session_id across turns
+		// (getAPIMetadata -> getSessionId); the proxy either preserves
+		// caller-supplied metadata or pins this id into CC-shaped metadata.
+		//
+		// We use a unique marker so a "correct" second answer must have seen
+		// the first turn (not just generic text).
+		marker := fmt.Sprintf("zebra-%d-%d", os.Getpid(), time.Now().UnixNano())
+		sessionID := fmt.Sprintf("itest-session-%d", os.Getpid())
+		turnHeaders := map[string]string{
+			"Content-Type":    "application/json",
+			"x-bf-vk":         vkValue,
+			"x-bf-session-id": sessionID,
+		}
+
+		// Turn 1: ask the model to remember a specific marker.
+		status, body := doJSON(t, client, http.MethodPost, bifrostURL+"/v1/chat/completions", turnHeaders, map[string]any{
+			"model": "anthropic/claude-opus-4-8",
+			"messages": []map[string]any{
+				{"role": "user", "content": "Memorize this exact token and repeat it back verbatim at the end of your reply: " + marker},
+			},
+		})
+		if status != http.StatusOK {
+			t.Fatalf("turn 1 -> %d\n%s", status, body)
+		}
+		var turn1 struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(body, &turn1); err != nil {
+			t.Fatalf("decode turn 1: %v\n%s", err, body)
+		}
+		if len(turn1.Choices) == 0 || strings.TrimSpace(turn1.Choices[0].Message.Content) == "" {
+			t.Fatalf("empty turn 1 content: %s", body)
+		}
+		t.Logf("turn 1 OK: assistant said %q", truncateStr(turn1.Choices[0].Message.Content, 80))
+
+		// Turn 2: same session id, full history (user + assistant) plus a
+		// follow-up that can only be answered correctly if the assistant
+		// message reached upstream.
+		status, body = doJSON(t, client, http.MethodPost, bifrostURL+"/v1/chat/completions", turnHeaders, map[string]any{
+			"model": "anthropic/claude-opus-4-8",
+			"messages": []map[string]any{
+				{"role": "user", "content": "Memorize this exact token and repeat it back verbatim at the end of your reply: " + marker},
+				{"role": "assistant", "content": turn1.Choices[0].Message.Content},
+				{"role": "user", "content": "What was the exact token I asked you to memorize? Reply with only the token."},
+			},
+		})
+		if status != http.StatusOK {
+			t.Fatalf("turn 2 -> %d\n%s", status, body)
+		}
+		var turn2 struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(body, &turn2); err != nil {
+			t.Fatalf("decode turn 2: %v\n%s", err, body)
+		}
+		if len(turn2.Choices) == 0 || strings.TrimSpace(turn2.Choices[0].Message.Content) == "" {
+			t.Fatalf("empty turn 2 content: %s", body)
+		}
+		if !strings.Contains(turn2.Choices[0].Message.Content, marker) {
+			t.Fatalf("context lost across turns: turn 2 did not mention the marker %q\nturn1=%q\nturn2=%q",
+				marker, truncateStr(turn1.Choices[0].Message.Content, 200), truncateStr(turn2.Choices[0].Message.Content, 200))
+		}
+		t.Logf("OK: multi-turn context preserved with stable session %q (turn 2 recalled the marker)", sessionID)
+	})
 }
 
 func mustAtoi(t *testing.T, s string) int {
