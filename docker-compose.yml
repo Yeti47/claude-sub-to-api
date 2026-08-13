@@ -14,6 +14,9 @@ services:
       UPSTREAM_BASE_URL: "https://api.anthropic.com"
       PROXY_API_KEY: ${PROXY_API_KEY:?set PROXY_API_KEY in .env}
       CREDENTIALS_PATH: "/data/.credentials.json"
+      # Serverless alternative: set CLAUDE_CREDENTIALS_JSON to the full
+      # credentials JSON and remove the /data volume below.
+      # CLAUDE_CREDENTIALS_JSON: ${CLAUDE_CREDENTIALS_JSON:-}
       LOG_LEVEL: "info"
       CLAUDE_UA: "claude-cli/2.1.44"
     volumes:

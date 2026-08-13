@@ -44,11 +44,12 @@ type httpClient interface {
 // Manager returns a valid access token, refreshing it before expiry and
 // persisting the rotated credentials back to disk.
 type Manager struct {
-	path   string
-	leeway time.Duration
-	client httpClient
-	now    func() time.Time
-	log    *zap.Logger
+	path    string
+	leeway  time.Duration
+	client  httpClient
+	now     func() time.Time
+	log     *zap.Logger
+	persist bool // false when creds came from an env var (no file to write back to)
 
 	mu       sync.Mutex
 	creds    *File
@@ -59,16 +60,36 @@ type Manager struct {
 // NewManager loads the credentials at path and returns a Manager.
 func NewManager(path string, leeway time.Duration, log *zap.Logger) (*Manager, error) {
 	m := &Manager{
-		path:   path,
-		leeway: leeway,
-		client: &http.Client{Timeout: 30 * time.Second},
-		now:    time.Now,
-		log:    log,
+		path:    path,
+		leeway:  leeway,
+		client:  &http.Client{Timeout: 30 * time.Second},
+		now:     time.Now,
+		log:     log,
+		persist: true,
 	}
 	if err := m.reloadFromDisk(); err != nil {
 		return nil, err
 	}
 	return m, nil
+}
+
+// NewManagerFromJSON loads credentials from a JSON payload (the contents of
+// ~/.claude/.credentials.json) supplied via an env var, e.g. for serverless
+// deployments (Azure ACA, etc.) where there is no writable credentials file.
+// Refreshed tokens are rotated in memory only and never persisted.
+func NewManagerFromJSON(jsonData string, leeway time.Duration, log *zap.Logger) (*Manager, error) {
+	f, err := LoadJSON([]byte(jsonData))
+	if err != nil {
+		return nil, err
+	}
+	return &Manager{
+		leeway:  leeway,
+		client:  &http.Client{Timeout: 30 * time.Second},
+		now:     time.Now,
+		log:     log,
+		persist: false,
+		creds:   f,
+	}, nil
 }
 
 // AccessToken returns a valid access token, refreshing it if it is within the
@@ -78,9 +99,11 @@ func (m *Manager) AccessToken(ctx context.Context) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Pick up external re-auth.
-	if changed, err := m.fileChangedLocked(); err == nil && changed {
-		_ = m.reloadFromDiskLocked()
+	// Pick up external re-auth (file-backed creds only; env-var creds are static).
+	if m.persist {
+		if changed, err := m.fileChangedLocked(); err == nil && changed {
+			_ = m.reloadFromDiskLocked()
+		}
 	}
 
 	if m.creds == nil {
@@ -206,6 +229,9 @@ func (m *Manager) fileChangedLocked() (bool, error) {
 }
 
 func (m *Manager) noteFileStatLocked() {
+	if !m.persist {
+		return
+	}
 	if st, err := os.Stat(m.path); err == nil {
 		m.lastMod = st.ModTime()
 		m.lastSize = st.Size()
@@ -213,7 +239,13 @@ func (m *Manager) noteFileStatLocked() {
 }
 
 // saveLocked writes the credentials back to disk atomically (tmp + rename), mode 0600.
+// When creds came from an env var there is nowhere to write them, so the
+// rotation is kept in memory only.
 func (m *Manager) saveLocked() error {
+	if !m.persist {
+		m.logger().Debug("skipping persist of rotated credentials (env-var source, no file)")
+		return nil
+	}
 	data, err := json.MarshalIndent(m.creds, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal credentials: %w", err)

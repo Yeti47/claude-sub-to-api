@@ -40,11 +40,20 @@ func run() error {
 	}
 	defer logger.Sync()
 
-	mgr, err := creds.NewManager(cfg.CredentialsPath, cfg.RefreshLeeway, logger)
-	if err != nil {
-		return err
+	var mgr *creds.Manager
+	if cfg.CredentialsJSON != "" {
+		mgr, err = creds.NewManagerFromJSON(cfg.CredentialsJSON, cfg.RefreshLeeway, logger)
+		if err != nil {
+			return err
+		}
+		logger.Info("loaded Claude subscription credentials from CLAUDE_CREDENTIALS_JSON env var")
+	} else {
+		mgr, err = creds.NewManager(cfg.CredentialsPath, cfg.RefreshLeeway, logger)
+		if err != nil {
+			return err
+		}
+		logger.Info("loaded Claude subscription credentials", zap.String("path", cfg.CredentialsPath))
 	}
-	logger.Info("loaded Claude subscription credentials", zap.String("path", cfg.CredentialsPath))
 
 	handler := proxy.NewHandler(cfg.UpstreamBaseURL, mgr, cfg.ClaudeUserAgent, logger)
 

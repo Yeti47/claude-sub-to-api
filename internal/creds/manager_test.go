@@ -46,10 +46,11 @@ func TestManager_RefreshesAndPersists(t *testing.T) {
 	}
 
 	m := &Manager{
-		path:   p,
-		leeway: 60 * time.Second,
-		client: srv.Client(),
-		now:    time.Now,
+		path:    p,
+		leeway:  60 * time.Second,
+		client:  srv.Client(),
+		now:     time.Now,
+		persist: true,
 	}
 	if err := m.reloadFromDisk(); err != nil {
 		t.Fatal(err)
@@ -107,6 +108,72 @@ func TestManager_ReturnsCachedWhenFresh(t *testing.T) {
 	}
 	if tok != "sk-ant-oat01-old" {
 		t.Fatalf("expected cached token, got %q", tok)
+	}
+}
+
+func TestManagerFromJSON_RefreshesInMemoryOnly(t *testing.T) {
+	// Fake token endpoint issues a new token.
+	var gotRefresh string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req refreshRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		gotRefresh = req.RefreshToken
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(refreshResponse{
+			AccessToken:  "sk-ant-oat01-new",
+			RefreshToken: "sk-ant-ort01-newref",
+			ExpiresIn:    3600,
+		})
+	}))
+	defer srv.Close()
+
+	// Expired token forces a refresh. persist=false: nothing may be written to disk.
+	m, err := NewManagerFromJSON(expiringCreds(1), 60*time.Second, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := srv.Client()
+	c.Transport = rewriteTransport{base: srv.URL, rt: c.Transport}
+	m.client = c
+
+	tok, err := m.AccessToken(context.Background())
+	if err != nil {
+		t.Fatalf("AccessToken: %v", err)
+	}
+	if tok != "sk-ant-oat01-new" {
+		t.Fatalf("got token %q, want refreshed in-memory token", tok)
+	}
+	if gotRefresh != "sk-ant-ort01-ref" {
+		t.Fatalf("refresh token sent = %q", gotRefresh)
+	}
+	// Rotation kept in memory (persist=false), not on disk.
+	if m.creds.ClaudeAiOauth.RefreshToken != "sk-ant-ort01-newref" {
+		t.Fatalf("in-memory refresh token = %q", m.creds.ClaudeAiOauth.RefreshToken)
+	}
+	if m.creds.ClaudeAiOauth.AccessToken != "sk-ant-oat01-new" {
+		t.Fatalf("in-memory access token = %q", m.creds.ClaudeAiOauth.AccessToken)
+	}
+
+	// Cached token served on the next call without another refresh.
+	tok2, err := m.AccessToken(context.Background())
+	if err != nil {
+		t.Fatalf("AccessToken (2nd): %v", err)
+	}
+	if tok2 != "sk-ant-oat01-new" {
+		t.Fatalf("second call got %q, want cached refreshed token", tok2)
+	}
+}
+
+func TestNewManagerFromJSON_Invalid(t *testing.T) {
+	if _, err := NewManagerFromJSON("{not json", 60*time.Second, nil); err == nil {
+		t.Fatal("expected error for invalid JSON")
+	}
+}
+
+func TestNewManagerFromJSON_MissingToken(t *testing.T) {
+	bad := `{"claudeAiOauth":{"refreshToken":"sk-ant-ort01-ref","expiresAt":1893456000000}}`
+	if _, err := NewManagerFromJSON(bad, 60*time.Second, nil); err == nil {
+		t.Fatal("expected error for missing accessToken")
 	}
 }
 

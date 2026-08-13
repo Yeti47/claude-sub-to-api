@@ -1,4 +1,5 @@
-// Package creds reads and validates an externally-generated ~/.claude/.credentials.json file.
+// Package creds reads and validates an externally-generated ~/.claude/.credentials.json file,
+// either from disk or from an in-memory JSON payload (e.g. an env var).
 package creds
 
 import (
@@ -28,14 +29,22 @@ func Load(path string) (*File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read credentials file %q: %w", path, err)
 	}
+	f, err := LoadJSON(data)
+	if err != nil {
+		return nil, fmt.Errorf("invalid credentials file %q: %w", path, err)
+	}
+	return f, nil
+}
 
+// LoadJSON parses and validates credentials from an in-memory JSON payload,
+// e.g. the contents of ~/.claude/.credentials.json supplied via an env var.
+func LoadJSON(data []byte) (*File, error) {
 	var f File
 	if err := json.Unmarshal(data, &f); err != nil {
-		return nil, fmt.Errorf("parse credentials file %q: %w", path, err)
+		return nil, fmt.Errorf("parse credentials JSON: %w", err)
 	}
-
 	if err := f.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid credentials file %q: %w", path, err)
+		return nil, fmt.Errorf("invalid credentials JSON: %w", err)
 	}
 	return &f, nil
 }

@@ -90,6 +90,7 @@ All configuration is via environment variables.
 | `LISTEN_ADDR`       | `:8080`                     | Address the server binds to.                           |
 | `UPSTREAM_BASE_URL` | `https://api.anthropic.com` | Anthropic API base URL.                                |
 | `CREDENTIALS_PATH`  | `/data/.credentials.json`   | Path to the externally-generated credentials file.     |
+| `CLAUDE_CREDENTIALS_JSON` | —                    | Full JSON content of `~/.claude/.credentials.json`, for serverless deployments (Azure ACA, etc.) with no writable credentials file. Takes precedence over `CREDENTIALS_PATH` when set. |
 | `LOG_LEVEL`         | `info`                      | `debug`, `info`, `warn`, or `error`.                   |
 | `CLAUDE_UA`         | `claude-cli/2.1.44`         | User-Agent sent to the upstream API.                   |
 | `REFRESH_LEEWAY`    | `60s`                       | How long before token expiry a refresh is triggered.   |
@@ -98,6 +99,26 @@ All configuration is via environment variables.
 
 - The proxy refreshes the OAuth access token automatically before it expires and writes the rotated credentials back to the file.
 - If you re-run `claude login` externally while the proxy is running, the proxy detects the changed file and picks up the new credentials without a restart.
+
+## Serverless deployments (env-var credentials)
+
+For serverless containers without a writable credentials file (e.g. Azure
+Container Apps), you can pass the entire contents of
+`~/.claude/.credentials.json` via the `CLAUDE_CREDENTIALS_JSON` env var. When
+set, it takes precedence over `CREDENTIALS_PATH` and no data volume is needed:
+
+```bash
+CLAUDE_CREDENTIALS_JSON='{"claudeAiOauth":{"accessToken":"sk-ant-oat...","refreshToken":"sk-ant-ort...","expiresAt":1893456000000}}' \
+  PROXY_API_KEY=dev-key go run ./cmd/claude-sub-to-api
+```
+
+Notes:
+- Set it directly from the file: `CLAUDE_CREDENTIALS_JSON="$(cat ~/.claude/.credentials.json)"`.
+- Refreshed tokens are rotated **in memory only** — they are not written back
+  to the env var. If the container restarts, it will use the original tokens
+  from the env var again (the access token is simply re-refreshed on demand).
+- File re-auth detection does not apply; restart the container with updated env
+  vars to pick up new credentials.
 
 ## Local development
 

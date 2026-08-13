@@ -18,6 +18,11 @@ type Config struct {
 	ProxyAPIKey string
 	// CredentialsPath is the path to the externally-generated ~/.claude/.credentials.json.
 	CredentialsPath string
+	// CredentialsJSON is the full JSON content of ~/.claude/.credentials.json,
+	// provided via the CLAUDE_CREDENTIALS_JSON env var. When set it takes
+	// precedence over CredentialsPath and no credentials file is required
+	// (intended for serverless deployments without a writable data dir).
+	CredentialsJSON string
 	// LogLevel is the zap log level (debug, info, warn, error).
 	LogLevel string
 	// ClaudeUserAgent is the User-Agent header sent to the upstream API.
@@ -33,6 +38,7 @@ func Load() (*Config, error) {
 		UpstreamBaseURL: strings.TrimRight(getEnv("UPSTREAM_BASE_URL", "https://api.anthropic.com"), "/"),
 		ProxyAPIKey:     os.Getenv("PROXY_API_KEY"),
 		CredentialsPath: getEnv("CREDENTIALS_PATH", "/data/.credentials.json"),
+		CredentialsJSON: os.Getenv("CLAUDE_CREDENTIALS_JSON"),
 		LogLevel:        strings.ToLower(getEnv("LOG_LEVEL", "info")),
 		ClaudeUserAgent: getEnv("CLAUDE_UA", "claude-cli/2.1.44"),
 		RefreshLeeway:   getEnvDuration("REFRESH_LEEWAY", 60*time.Second),

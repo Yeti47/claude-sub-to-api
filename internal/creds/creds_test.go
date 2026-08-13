@@ -65,3 +65,26 @@ func TestLoad_WrongPrefix(t *testing.T) {
 		t.Fatal("expected error for non-OAuth token prefix")
 	}
 }
+
+func TestLoadJSON_Valid(t *testing.T) {
+	f, err := LoadJSON([]byte(validCreds))
+	if err != nil {
+		t.Fatalf("LoadJSON: %v", err)
+	}
+	if f.ClaudeAiOauth.AccessToken != "sk-ant-oat01-abc" || f.ClaudeAiOauth.RefreshToken != "sk-ant-ort01-xyz" {
+		t.Fatalf("unexpected tokens: %+v", f.ClaudeAiOauth)
+	}
+}
+
+func TestLoadJSON_Malformed(t *testing.T) {
+	if _, err := LoadJSON([]byte("{not json")); err == nil {
+		t.Fatal("expected error for malformed JSON")
+	}
+}
+
+func TestLoadJSON_MissingAccessToken(t *testing.T) {
+	bad := strings.Replace(validCreds, `"accessToken": "sk-ant-oat01-abc",`, "", 1)
+	if _, err := LoadJSON([]byte(bad)); err == nil {
+		t.Fatal("expected error for missing accessToken")
+	}
+}
