@@ -74,11 +74,59 @@ The consumer key is accepted as `Authorization: Bearer <key>` or `x-api-key: <ke
 
 ## Endpoints
 
-| Method | Path           | Auth | Description                                   |
-|--------|----------------|------|-----------------------------------------------|
-| POST   | `/v1/messages` | yes  | Anthropic Messages API (stream + non-stream). |
-| GET    | `/v1/models`   | yes  | Model list (proxied from upstream).           |
-| GET    | `/healthz`     | no   | Liveness probe.                               |
+| Method | Path                    | Auth | Description                                   |
+|--------|-------------------------|------|-----------------------------------------------|
+| POST   | `/v1/messages`          | yes  | Anthropic Messages API (stream + non-stream). |
+| GET    | `/v1/models`            | yes  | Model list (proxied from upstream).           |
+| GET    | `/v1/keepalive`         | yes  | One-shot forced token rotation (pulse).       |
+| POST   | `/v1/keepalive/auto`    | yes  | Enable auto-keepalive (idempotent).           |
+| DELETE | `/v1/keepalive/auto`    | yes  | Disable auto-keepalive (idempotent).          |
+| GET    | `/healthz`              | no   | Liveness probe. Reports 503 if the token is missing or invalid. |
+
+## Keepalive
+
+Normal request handling refreshes the OAuth token **lazily**: only when a
+request needs it and the token is within `REFRESH_LEEWAY` of expiring.
+Keepalive is different — every pulse performs a **real token rotation** at the
+OAuth token endpoint (`https://console.anthropic.com/v1/oauth/token`),
+**independent of `REFRESH_LEEWAY`**. This keeps the token and its refresh-token
+chain perpetually fresh even while the proxy is completely idle (e.g. to keep
+an external re-auth session alive).
+
+Two options:
+
+- **One-shot pulse** — `GET /v1/keepalive` forces a single token rotation
+  (returns `503` if the rotation fails). Useful for cron/Uptime-Kuma style
+  schedulers. It also reports when the token should be rotated again.
+- **Auto-keepalive** — a background goroutine forces a rotation immediately on
+  enable, then self-schedules: each rotation reports the timestamp at which the
+  next one should happen (the token's expiry minus `REFRESH_LEEWAY`, already
+  factored in), so the cadence follows the token's own lifetime rather than a
+  fixed interval. It can be enabled at startup via `AUTO_KEEPALIVE=true`, or
+  toggled at runtime:
+
+  ```bash
+  export PROXY_API_KEY=your-key
+
+  # Enable (idempotent)
+  curl -X POST http://localhost:8080/v1/keepalive/auto -H "x-api-key: $PROXY_API_KEY"
+
+  # Status / one-shot pulse
+  curl http://localhost:8080/v1/keepalive -H "x-api-key: $PROXY_API_KEY"
+
+  # Disable (idempotent)
+  curl -X DELETE http://localhost:8080/v1/keepalive/auto -H "x-api-key: $PROXY_API_KEY"
+  ```
+
+  All three endpoints return `{"status":"ok","auto_keepalive":<bool>}`; the
+  pulse response also includes `next_refresh_at` (RFC3339), the time at which
+  the token should be rotated again.
+
+> **Note:** every pulse hits the OAuth token endpoint and issues a fresh access
+> token plus a brand-new refresh token, invalidating the previous refresh
+> token. If another process (e.g. Claude Code CLI) shares the same credentials
+> file, each rotation can invalidate that process's refresh token — an
+> unavoidable consequence of keeping the session perpetually fresh.
 
 ## Configuration
 
@@ -94,6 +142,11 @@ All configuration is via environment variables.
 | `LOG_LEVEL`         | `info`                      | `debug`, `info`, `warn`, or `error`.                   |
 | `CLAUDE_UA`         | `claude-cli/2.1.44`         | User-Agent sent to the upstream API.                   |
 | `REFRESH_LEEWAY`    | `60s`                       | How long before token expiry a refresh is triggered.   |
+| `AUTO_KEEPALIVE`    | `false`                     | Start the auto-keepalive goroutine at boot (`true`/`1`).|
+
+The auto-keepalive cadence is not configured: each rotation reports when the
+next one should happen (expiry minus `REFRESH_LEEWAY`), so it follows the
+token's own lifetime.
 
 ## Token refresh & re-auth
 

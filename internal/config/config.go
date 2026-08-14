@@ -29,6 +29,9 @@ type Config struct {
 	ClaudeUserAgent string
 	// RefreshLeeway is how long before token expiry a refresh is triggered.
 	RefreshLeeway time.Duration
+	// AutoKeepalive enables the background token-refresh goroutine at startup.
+	// It self-schedules: each rotation reports when the next one should happen.
+	AutoKeepalive bool
 }
 
 // Load reads configuration from environment variables and validates it.
@@ -42,6 +45,7 @@ func Load() (*Config, error) {
 		LogLevel:        strings.ToLower(getEnv("LOG_LEVEL", "info")),
 		ClaudeUserAgent: getEnv("CLAUDE_UA", "claude-cli/2.1.44"),
 		RefreshLeeway:   getEnvDuration("REFRESH_LEEWAY", 60*time.Second),
+		AutoKeepalive:   getEnvBool("AUTO_KEEPALIVE", false),
 	}
 
 	if cfg.ProxyAPIKey == "" {
@@ -71,4 +75,17 @@ func getEnvDuration(key string, def time.Duration) time.Duration {
 		}
 	}
 	return def
+}
+
+// getEnvBool parses a boolean env var, accepting common true/false spellings
+// (1/true/yes/on and 0/false/no/off). Any other value falls back to def.
+func getEnvBool(key string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
 }

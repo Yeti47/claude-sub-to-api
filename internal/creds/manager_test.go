@@ -111,6 +111,190 @@ func TestManager_ReturnsCachedWhenFresh(t *testing.T) {
 	}
 }
 
+func TestManager_RefreshForcesRotationWhenFresh(t *testing.T) {
+	// Fake token endpoint issues a new token.
+	var gotRefresh string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req refreshRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		gotRefresh = req.RefreshToken
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(refreshResponse{
+			AccessToken:  "sk-ant-oat01-new",
+			RefreshToken: "sk-ant-ort01-newref",
+			ExpiresIn:    3600,
+		})
+	}))
+	defer srv.Close()
+
+	// Token is fresh (far in the future): AccessToken would serve the cache,
+	// but Refresh must rotate regardless of the leeway.
+	future := time.Now().Add(2 * time.Hour).UnixMilli()
+	p := filepath.Join(t.TempDir(), ".credentials.json")
+	if err := os.WriteFile(p, []byte(expiringCreds(future)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{
+		path:    p,
+		leeway:  60 * time.Second,
+		now:     time.Now,
+		persist: true,
+	}
+	if err := m.reloadFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	c := srv.Client()
+	c.Transport = rewriteTransport{base: srv.URL, rt: c.Transport}
+	m.client = c
+
+	tok, next, err := m.Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if tok != "sk-ant-oat01-new" {
+		t.Fatalf("got token %q, want rotated", tok)
+	}
+	if gotRefresh != "sk-ant-ort01-ref" {
+		t.Fatalf("refresh token sent = %q", gotRefresh)
+	}
+
+	// ExpiresIn=3600, leeway=60s -> the reported next refresh should be
+	// ~now+3540s (expiry minus leeway, already factored in).
+	if !next.After(time.Now().Add(3500 * time.Second)) {
+		t.Fatalf("next = %v, want ~expiry - leeway in the future", next)
+	}
+	if !next.Before(time.Now().Add(3600 * time.Second)) {
+		t.Fatalf("next = %v, want ~expiry - leeway in the future", next)
+	}
+
+	// Rotated creds persisted to disk.
+	reloaded, err := Load(p)
+	if err != nil {
+		t.Fatalf("reload persisted creds: %v", err)
+	}
+	if reloaded.ClaudeAiOauth.AccessToken != "sk-ant-oat01-new" {
+		t.Fatalf("persisted access token = %q", reloaded.ClaudeAiOauth.AccessToken)
+	}
+	if reloaded.ClaudeAiOauth.RefreshToken != "sk-ant-ort01-newref" {
+		t.Fatalf("persisted refresh token = %q", reloaded.ClaudeAiOauth.RefreshToken)
+	}
+}
+
+func TestManager_RefreshFloorsStaleExpiry(t *testing.T) {
+	// Fake token endpoint omits ExpiresIn, so refreshLocked keeps the stored
+	// (past) expiry. Refresh must floor the reported next-refresh time instead
+	// of handing back a past timestamp.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(refreshResponse{
+			AccessToken:  "sk-ant-oat01-new",
+			RefreshToken: "sk-ant-ort01-newref",
+			// ExpiresIn omitted -> 0 -> ExpiresAt stays stale.
+		})
+	}))
+	defer srv.Close()
+
+	// Credentials whose token is already expired.
+	p := filepath.Join(t.TempDir(), ".credentials.json")
+	if err := os.WriteFile(p, []byte(expiringCreds(1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{
+		path:    p,
+		leeway:  60 * time.Second,
+		now:     time.Now,
+		persist: true,
+	}
+	if err := m.reloadFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	c := srv.Client()
+	c.Transport = rewriteTransport{base: srv.URL, rt: c.Transport}
+	m.client = c
+
+	tok, next, err := m.Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if tok != "sk-ant-oat01-new" {
+		t.Fatalf("got token %q, want rotated", tok)
+	}
+	// Stale expiry must be floored to ~minNextRefresh in the future.
+	if !next.After(time.Now().Add(30 * time.Second)) {
+		t.Fatalf("next = %v, want floored ~1m in the future", next)
+	}
+	if !next.Before(time.Now().Add(2 * time.Minute)) {
+		t.Fatalf("next = %v, want floored ~1m in the future", next)
+	}
+}
+
+func TestManager_RefreshErrorsWithoutCreds(t *testing.T) {
+	m := &Manager{}
+	if _, _, err := m.Refresh(context.Background()); err == nil {
+		t.Fatal("expected error when no credentials loaded")
+	}
+}
+
+func TestManager_Healthy_ValidToken(t *testing.T) {
+	// Expires far in the future: Healthy must be true without any HTTP client
+	// (proving it never attempts a rotation or network call).
+	future := time.Now().Add(2 * time.Hour).UnixMilli()
+	p := filepath.Join(t.TempDir(), ".credentials.json")
+	if err := os.WriteFile(p, []byte(expiringCreds(future)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{path: p, leeway: 60 * time.Second, now: time.Now, persist: true}
+	if err := m.reloadFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	if !m.Healthy() {
+		t.Fatal("Healthy() = false, want true for a valid, non-expired token")
+	}
+}
+
+func TestManager_Healthy_WithinLeewayStillHealthy(t *testing.T) {
+	// Token expires in 30s, leeway is 60s: within-leeway tokens remain usable
+	// (AccessToken would refresh on demand) and must NOT be reported unhealthy.
+	soon := time.Now().Add(30 * time.Second).UnixMilli()
+	p := filepath.Join(t.TempDir(), ".credentials.json")
+	if err := os.WriteFile(p, []byte(expiringCreds(soon)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{path: p, leeway: 60 * time.Second, now: time.Now, persist: true}
+	if err := m.reloadFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	if !m.Healthy() {
+		t.Fatal("Healthy() = false, want true for a within-leeway (still valid) token")
+	}
+}
+
+func TestManager_Healthy_ExpiredToken(t *testing.T) {
+	p := filepath.Join(t.TempDir(), ".credentials.json")
+	if err := os.WriteFile(p, []byte(expiringCreds(1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{path: p, leeway: 60 * time.Second, now: time.Now, persist: true}
+	if err := m.reloadFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	if m.Healthy() {
+		t.Fatal("Healthy() = true, want false for an expired token")
+	}
+}
+
+func TestManager_Healthy_NoCreds(t *testing.T) {
+	m := &Manager{}
+	if m.Healthy() {
+		t.Fatal("Healthy() = true, want false when no credentials are loaded")
+	}
+}
+
 func TestManagerFromJSON_RefreshesInMemoryOnly(t *testing.T) {
 	// Fake token endpoint issues a new token.
 	var gotRefresh string

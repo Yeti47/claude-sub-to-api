@@ -19,6 +19,10 @@ services:
       # CLAUDE_CREDENTIALS_JSON: ${CLAUDE_CREDENTIALS_JSON:-}
       LOG_LEVEL: "info"
       CLAUDE_UA: "claude-cli/2.1.44"
+      # Keep the OAuth token rotated while idle: auto-keepalive forces a real
+      # rotation immediately on enable and self-schedules each next rotation
+      # from the token's own expiry. AUTO_KEEPALIVE=false by default.
+      AUTO_KEEPALIVE: "${AUTO_KEEPALIVE:-false}"
     volumes:
       # Drop your externally-generated .credentials.json into this volume/dir.
       - ~/.config/claude-sub-to-api:/data

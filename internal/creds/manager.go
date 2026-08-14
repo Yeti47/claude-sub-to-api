@@ -130,6 +130,76 @@ func (m *Manager) AccessToken(ctx context.Context) (string, error) {
 	return m.creds.ClaudeAiOauth.AccessToken, nil
 }
 
+// minNextRefresh floors the timestamp reported by Refresh: if the upstream
+// omits ExpiresIn and the stored expiry is stale, the computed next-refresh
+// time would be in the past; flooring it keeps callers from hot-looping.
+const minNextRefresh = time.Minute
+
+// Refresh forces an OAuth token rotation now, regardless of whether the
+// current token is within the refresh leeway. This is what keepalive uses to
+// keep the token — and its refresh-token chain — perpetually fresh even while
+// the proxy is idle. Like AccessToken, it re-reads the file if it changed on
+// disk so an external `claude login` re-auth is picked up without a restart.
+//
+// It returns the rotated access token and the timestamp at which the token
+// should be rotated again (its expiry minus the refresh leeway, already
+// factored in), so callers can schedule the next rotation without a fixed
+// interval. The timestamp is floored to at least minNextRefresh in the future.
+func (m *Manager) Refresh(ctx context.Context) (string, time.Time, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Pick up external re-auth (file-backed creds only; env-var creds are static).
+	if m.persist {
+		if changed, err := m.fileChangedLocked(); err == nil && changed {
+			_ = m.reloadFromDiskLocked()
+		}
+	}
+
+	if m.creds == nil {
+		return "", time.Time{}, fmt.Errorf("no credentials loaded")
+	}
+
+	m.logger().Info("forcing token rotation (keepalive)",
+		zap.Time("expires_at", time.UnixMilli(m.creds.ClaudeAiOauth.ExpiresAt)),
+	)
+	if err := m.refreshLocked(ctx); err != nil {
+		return "", time.Time{}, err
+	}
+	m.logger().Info("rotated access token",
+		zap.Time("new_expires_at", time.UnixMilli(m.creds.ClaudeAiOauth.ExpiresAt)),
+	)
+
+	next := time.UnixMilli(m.creds.ClaudeAiOauth.ExpiresAt).Add(-m.leeway)
+	if floor := m.now().Add(minNextRefresh); next.Before(floor) {
+		next = floor
+	}
+	return m.creds.ClaudeAiOauth.AccessToken, next, nil
+}
+
+// Healthy reports whether the proxy is usable: credentials are loaded and the
+// current access token is present and not yet expired (by its recorded
+// expiry). It never triggers a token rotation and makes no network calls, so
+// it is safe for liveness probes. Within-leeway tokens still count as healthy
+// — the token remains valid until its recorded expiry.
+func (m *Manager) Healthy() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Pick up external re-auth (file-backed creds only; env-var creds are static).
+	if m.persist {
+		if changed, err := m.fileChangedLocked(); err == nil && changed {
+			_ = m.reloadFromDiskLocked()
+		}
+	}
+
+	if m.creds == nil || m.creds.ClaudeAiOauth.AccessToken == "" {
+		return false
+	}
+	expiresAt := time.UnixMilli(m.creds.ClaudeAiOauth.ExpiresAt)
+	return m.now().Before(expiresAt)
+}
+
 // logger returns the configured logger, or a no-op one if unset (e.g. in tests).
 func (m *Manager) logger() *zap.Logger {
 	if m.log == nil {
