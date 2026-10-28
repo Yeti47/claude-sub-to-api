@@ -3,7 +3,7 @@ import { query as sdkQuery, type SDKMessage, type SDKUserMessage } from "@anthro
 import type { Config } from "../config.js";
 import { errorMessage, type Logger } from "../logger.js";
 import type { MessagesRequest, MessagesResponse } from "../anthropic/types.js";
-import { effectiveSystemPrompt, prepareTurn } from "../anthropic/translate.js";
+import { prepareTurn } from "../anthropic/translate.js";
 import { buildToolBridge } from "../anthropic/tools.js";
 import { MessageAssembler } from "./assembler.js";
 import { Semaphore } from "./semaphore.js";
@@ -98,6 +98,34 @@ function errorFor(result: { type: string; message: string }): ApiError {
   return new ApiError(502, "api_error", result.message);
 }
 
+const RUNTIME_NOTE = [
+  "<runtime_info>",
+  "You are running in claude-sub-to-api, an Anthropic-compatible HTTP API backed by a Claude subscription, through the Claude Code harness.",
+  "The built-in Claude Code tools (Bash, Read, Edit, and so on) are disabled. The only tools available are the ones defined in this request; they are provided by the API client, which executes them, and their results come back in a later message.",
+  "If you are asked what you are running in, say this plainly. Do not claim to be Claude Code itself, and do not imply the API client is Claude Code.",
+  "</runtime_info>",
+].join("\n");
+
+function systemPromptOption(clientSystem: string | undefined): Record<string, unknown> {
+  const append = [
+    RUNTIME_NOTE,
+    clientSystem
+      ? `# API client instructions\n\nThe API client that sent this request supplied the following instructions. Follow them for this turn; they take precedence over the harness's coding-specific guidance.\n\n${clientSystem}`
+      : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  return {
+    type: "preset",
+    preset: "claude_code",
+    // Keeps cwd, memory path and git status out of the system prompt, so it
+    // stays stable across sessions and can be read from the prompt cache.
+    excludeDynamicSections: true,
+    append,
+  };
+}
+
 export class ClaudeRunner {
   private readonly limit: Semaphore;
 
@@ -175,9 +203,8 @@ export class ClaudeRunner {
         ? maxTokens
         : Math.max(maxTokens, 1024);
 
-    const system = [effectiveSystemPrompt(request.system), prepared.toolChoiceNote]
-      .filter(Boolean)
-      .join("\n\n");
+    const system = prepared.system;
+    const systemOption = systemPromptOption(system);
     const controller = new AbortController();
     const onAbort = () => {
       this.logger.debug("client aborted turn", { requestId });
@@ -201,7 +228,7 @@ export class ClaudeRunner {
       abortController: controller,
       stderr: (line: string) => this.logger.debug("claude stderr", { requestId, line }),
     };
-    if (system) options.systemPrompt = system;
+    if (systemOption) options.systemPrompt = systemOption;
     const effort = request.output_config?.effort;
     if (
       typeof effort === "string" &&

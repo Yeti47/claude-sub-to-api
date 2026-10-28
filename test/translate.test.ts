@@ -28,6 +28,8 @@ test("joins system blocks and appends a forced tool-choice instruction", () => {
   });
   assert.equal(prepared.system, "Be terse.\n\nUse JSON.");
   assert.match(prepared.toolChoiceNote ?? "", /only available tool/);
+  const content = prepared.prompt.message.content as Array<{ text?: string }>;
+  assert.match(content.map((block) => block.text ?? "").join("\n"), /only available tool/);
   assert.equal(prepared.tools.length, 1);
 });
 

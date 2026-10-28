@@ -19,7 +19,9 @@ Anthropic
 
 ## How it works
 
-- `POST /v1/messages` turns the Messages API request into one Agent SDK turn. The client's system prompt replaces Claude Code's prompt, built-in tools are disabled, project settings/skills/MCP servers are not loaded, and each conversation is bound to a persisted Claude session when possible.
+- `POST /v1/messages` turns the Messages API request into one Agent SDK turn. Claude runs with its normal Claude Code harness prompt; the client's system prompt is appended as turn instructions and takes precedence for that request. Built-in tools are disabled, and project settings/skills/MCP servers are not loaded.
+- The model is told plainly that it runs in `claude-sub-to-api` through the Claude Code harness, and that the tools come from the API client. Nothing pretends to be the Anthropic API or hides the harness.
+- Each conversation is bound to a persisted Claude session when possible. Resuming it, together with `excludeDynamicSections`, keeps the harness prompt stable and produced real prompt-cache reads in testing.
 - Conversation history is replayed as a transcript on every request (the server is stateless). The final user turn, including images and documents, is passed through natively.
 - Client-defined `tools` are exposed to Claude as an in-process MCP server. When Claude calls one, the server returns a normal `tool_use` block and stops the turn. The client executes the tool and sends a follow-up request containing `tool_result`.
 - `GET /v1/models` asks the signed-in CLI which models the account can use.
@@ -111,13 +113,30 @@ Tool names are translated to MCP-safe names internally and mapped back in respon
 
 `tool_choice` is supported as follows: `none` hides tools, `auto` is the normal behavior, and `any` / `tool` add a strong instruction but cannot force the underlying CLI's tool-selection mode.
 
+## No disguise
+
+This is a community proxy, not Anthropic software. The model is told that plainly:
+
+- It runs in **claude-sub-to-api**, through the **Claude Code harness**.
+- Claude Code's built-in tools (Bash, Read, Edit, …) are disabled. Tools in a request come from the API client, which executes them and returns the results in a later message.
+- If asked what it is running in, it should say so rather than claim to be Claude Code or imply the API client is Claude Code.
+
+The proxy does not fake Claude Code headers, does not send a synthetic Claude Code identity marker, and does not replace Claude Code's system prompt. It uses the normal harness prompt and appends the client's instructions. Tool definitions are exposed to the model as `mcp__claude_sub_to_api__<name>`; responses map them back to the names the client sent.
+
+One consequence is that the harness prompt is coding-oriented and the CLI attaches workspace context. With no client system prompt, Claude may talk about the working directory or repository. Set `CLAUDE_CWD` to a neutral directory if that is not wanted.
+
 ## Session resume and prompt caching
 
 Every request carries a conversation key: the `x-session-id`, `x-bf-session-id` or `x-claude-session-id` header, the `metadata.user_id.session_id` field, or finally a hash of the first user message. The server persists a binding from that key to the Claude Code session id in `STATE_PATH` (default `<claude config dir>/sub-to-api-sessions.json`).
 
 When the next request's user turns extend the bound history, the proxy resumes the same Claude session and sends only the new turn instead of replaying a reconstructed transcript. A changed model, system prompt, shortened/edited history, retry with no new user turn, or a tool-result turn starts a fresh session and falls back to the transcript path.
 
-This is the same mechanism [opencode-claude](https://github.com/openchamber/opencode-claude) uses. It keeps Claude Code's native transcript and lets the CLI reuse its prompt cache. The CLI still injects its own environment/account context and decides where to place cache breakpoints, so cache hits are not guaranteed: in short local tests the CLI reported cache writes (`cache_creation_input_tokens`) but no reads (`cache_read_input_tokens`) even for a resumed turn. Treat resume as avoiding re-serialized history, not as a promise of zero-cost context.
+This is the same mechanism [opencode-claude](https://github.com/openchamber/opencode-claude) uses. With the stable harness prompt (`excludeDynamicSections: true`) and resume, a live two-turn Haiku test showed real cache reuse:
+
+- turn 1: `cache_read_input_tokens: 658`, `cache_creation_input_tokens: 2490`
+- turn 2, resumed: `cache_read_input_tokens: 2813`, `cache_creation_input_tokens: 489`
+
+An earlier build that replaced the harness prompt with a custom prompt reported no cache reads on resume. Keeping Claude Code's prompt and letting it move dynamic sections into the first message is what made the difference. It is still best-effort: the CLI controls breakpoint placement, and a tool-result turn starts a fresh session today.
 
 Prompt caching improves when:
 
@@ -144,7 +163,7 @@ All configuration is environment-based.
 | `MAX_CONCURRENCY` | `4` | Maximum simultaneous Claude Code processes. |
 | `REQUEST_TIMEOUT_MS` | `900000` | Per-request upper bound. |
 | `DEFAULT_MAX_TOKENS` | `8192` | Output ceiling when `max_tokens` is omitted (the Messages API requires it). |
-| `CLAUDE_CWD` | process cwd | Working directory for the CLI. No project settings are loaded. |
+| `CLAUDE_CWD` | process cwd | Working directory for the CLI. Use a neutral empty directory for an API-only setup; it keeps repository context out of the prompt. |
 | `CLAUDE_CODE_EXECUTABLE` | SDK default | Path to a specific Claude Code executable. |
 | `STATE_PATH` | `<claude config dir>/sub-to-api-sessions.json` | Persisted conversation → Claude session bindings. |
 | `CLAUDE_CODE_MAX_RETRIES` | `0` | CLI API retries. Keep `0` so one API request maps to one model response; clients own retries. |

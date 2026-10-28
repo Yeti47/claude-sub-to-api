@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { mkdir } from "node:fs/promises";
 import { loadConfig } from "./config.js";
 import { createLogger } from "./logger.js";
 import { prepareClaudeAuth } from "./auth/claude-auth.js";
@@ -22,6 +23,15 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const logger = createLogger(config.logLevel);
   const auth = await prepareClaudeAuth(config, logger);
+  try {
+    await mkdir(config.cwd, { recursive: true });
+  } catch (error) {
+    logger.warn("CLAUDE_CWD is not usable; falling back to the process directory", {
+      cwd: config.cwd,
+      error: String(error),
+    });
+    config.cwd = process.cwd();
+  }
   const runner = new ClaudeRunner(config, logger);
   const models = new ModelCatalog(config, logger);
   const statePath =

@@ -35,13 +35,6 @@ export function contentBlocks(content: string | ContentBlock[]): ContentBlock[] 
   return Array.isArray(content) ? content : [];
 }
 
-export const DEFAULT_SYSTEM_PROMPT =
-  "You are Claude, a helpful AI assistant. Respond directly to the user.";
-
-export function effectiveSystemPrompt(system: unknown): string {
-  return systemText(system) ?? DEFAULT_SYSTEM_PROMPT;
-}
-
 export function systemText(system: unknown): string | undefined {
   if (!system) return undefined;
   if (typeof system === "string") return system.trim() || undefined;
@@ -242,6 +235,9 @@ export function prepareTurn(
 
     direct = blocks.length > 0 ? blocks : [{ type: "text", text: "" }];
   }
+
+  const choiceNote = toolChoiceNote(request);
+  if (choiceNote) direct = [...direct, { type: "text", text: choiceNote }];
 
   const prompt = {
     type: "user" as const,

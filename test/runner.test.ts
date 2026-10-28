@@ -59,7 +59,17 @@ test("runs a text turn and configures a constrained SDK session", async () => {
 
   assert.equal(result.content[0]?.type, "text");
   assert.equal(result.stop_reason, "end_turn");
-  assert.equal(options?.systemPrompt, "Be brief.");
+  const systemPrompt = options?.systemPrompt as {
+    type?: string;
+    preset?: string;
+    excludeDynamicSections?: boolean;
+    append?: string;
+  };
+  assert.equal(systemPrompt.type, "preset");
+  assert.equal(systemPrompt.preset, "claude_code");
+  assert.equal(systemPrompt.excludeDynamicSections, true);
+  assert.match(systemPrompt.append ?? "", /claude-sub-to-api/);
+  assert.match(systemPrompt.append ?? "", /Be brief\./);
   assert.deepEqual(options?.tools, []);
   assert.equal(options?.permissionMode, "dontAsk");
   assert.equal(options?.maxTurns, 1);
@@ -80,7 +90,7 @@ test("stops after a tool_use turn and maps the tool name", async () => {
         event: {
           type: "content_block_start",
           index: 0,
-          content_block: { type: "tool_use", id: "t1", name: "mcp__proxy__lookup" },
+          content_block: { type: "tool_use", id: "t1", name: "mcp__claude_sub_to_api__lookup" },
         },
       },
       { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"q":"x"}' } } },

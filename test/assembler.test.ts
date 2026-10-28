@@ -5,8 +5,8 @@ import type { ToolBridge } from "../src/anthropic/tools.js";
 
 const bridge: ToolBridge = {
   mcpServers: {},
-  toClientName: new Map([["mcp__proxy__search", "search"]]),
-  exposedNames: ["mcp__proxy__search"],
+  toClientName: new Map([["mcp__claude_sub_to_api__search", "search"]]),
+  exposedNames: ["mcp__claude_sub_to_api__search"],
 };
 
 test("assembles a text message from stream events", () => {
@@ -63,7 +63,7 @@ test("maps MCP tool names and parses tool input", () => {
     event: {
       type: "content_block_start",
       index: 0,
-      content_block: { type: "tool_use", id: "toolu_1", name: "mcp__proxy__search" },
+      content_block: { type: "tool_use", id: "toolu_1", name: "mcp__claude_sub_to_api__search" },
     },
   });
   assembler.handle({
@@ -101,7 +101,7 @@ test("falls back to complete assistant messages without partial events", () => {
       usage: { input_tokens: 7, output_tokens: 2 },
       content: [
         { type: "text", text: "one moment" },
-        { type: "tool_use", id: "t1", name: "mcp__proxy__search", input: { q: 1 } },
+        { type: "tool_use", id: "t1", name: "mcp__claude_sub_to_api__search", input: { q: 1 } },
       ],
     },
   });

@@ -15,7 +15,7 @@ import {
 import { z } from "zod";
 import type { ToolDefinition } from "./types.js";
 
-export const MCP_SERVER_NAME = "proxy";
+export const MCP_SERVER_NAME = "claude_sub_to_api";
 export const MCP_TOOL_PREFIX = `mcp__${MCP_SERVER_NAME}__`;
 
 export class ToolCallParked extends Error {

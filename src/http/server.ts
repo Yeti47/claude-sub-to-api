@@ -5,7 +5,7 @@ import type { Logger } from "../logger.js";
 import { isAuthorized } from "../auth/api-key.js";
 import type { PreparedAuth } from "../auth/claude-auth.js";
 import type { MessagesRequest } from "../anthropic/types.js";
-import { effectiveSystemPrompt } from "../anthropic/translate.js";
+import { systemText } from "../anthropic/translate.js";
 import { ApiError, ClientAbort, ClaudeRunner } from "../claude/runner.js";
 import type { ModelCatalog } from "../claude/models.js";
 import type { SessionStore } from "../session/store.js";
@@ -113,7 +113,7 @@ export function createHandler(deps: Deps) {
       request.metadata?.user_id,
     );
     const hashes = userMessageHashes(request.messages);
-    const promptHash = systemHash(effectiveSystemPrompt(request.system));
+    const promptHash = systemHash(systemText(request.system) ?? null);
     const plan = deps.sessions.plan({
       key,
       messages: request.messages,

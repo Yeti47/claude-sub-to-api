@@ -22,5 +22,8 @@ services:
       LOG_LEVEL: "info"
       MAX_CONCURRENCY: "4"
       REQUEST_TIMEOUT_MS: "900000"
+      # A neutral, stable working directory keeps the harness context out of
+      # the repository and makes the cached system prompt reusable.
+      CLAUDE_CWD: "/data/workspace"
     volumes:
       - ~/.config/claude-sub-to-api:/data
