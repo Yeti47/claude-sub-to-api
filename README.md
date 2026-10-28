@@ -42,7 +42,7 @@ Anthropic
    # if the CLI is not installed: npm install -g @anthropic-ai/claude-code
    ```
 
-   Complete the browser login and copy the token. It is reported to last about a year; run the command again when it expires.
+   Complete the browser login and copy the token. It lasts about a year; run the command again when it expires. The proxy does not refresh it.
 
 2. Configure the proxy:
 
