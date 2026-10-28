@@ -33,6 +33,7 @@ function classifySynthetic(text: string): string {
   if (/rate limit|429/.test(lower)) return "rate_limit";
   if (/overload|529/.test(lower)) return "overloaded";
   if (/model_not_found|model not found/.test(lower)) return "model_not_found";
+  if (/image|unprocessable|invalid|not supported/.test(lower)) return "invalid_request";
   return "api_error";
 }
 
@@ -47,12 +48,18 @@ export class MessageAssembler {
   sawMessageStop = false;
   sawStreamEvents = false;
   resultError: { type: string; message: string } | null = null;
+  /** A CLI-level notice (not model output) that must fail the request. */
+  fatalError = false;
   private blocks = new Map<number, BlockState>();
+  private indexMap = new Map<number, number>();
+  private suppressed = new Set<number>();
+  private nextIndex = 0;
 
   constructor(
     readonly requestedModel: string,
     private readonly bridge: ToolBridge | undefined,
     private readonly onEvent?: (event: Record<string, unknown>) => void,
+    private readonly includeThinking = true,
   ) {
     this.model = requestedModel;
   }
@@ -90,9 +97,20 @@ export class MessageAssembler {
     const type = event.type;
 
     if (type === "message_start") {
+      // A retried or follow-up API message starts over; the response must
+      // describe the final message, not a concatenation of attempts.
+      this.blocks.clear();
+      this.indexMap.clear();
+      this.suppressed.clear();
+      this.nextIndex = 0;
+      this.content = [];
+      this.stopReason = null;
+      this.stopSequence = null;
+      this.sawToolUse = false;
+      this.sawMessageStop = false;
       const message = (event.message ?? {}) as Record<string, unknown>;
       if (typeof message.id === "string") this.id = message.id;
-      this.usage = { ...this.usage, ...usageOf(message.usage) };
+      this.usage = { input_tokens: 0, output_tokens: 0, ...usageOf(message.usage) };
       this.emit({
         type: "message_start",
         message: {
@@ -108,8 +126,17 @@ export class MessageAssembler {
     }
 
     if (type === "content_block_start") {
-      const index = Number(event.index ?? this.blocks.size);
+      const sdkIndex = Number(event.index ?? this.blocks.size);
       const raw = (event.content_block ?? {}) as Record<string, unknown>;
+      if (
+        !this.includeThinking &&
+        (raw.type === "thinking" || raw.type === "redacted_thinking")
+      ) {
+        this.suppressed.add(sdkIndex);
+        return;
+      }
+      const index = this.nextIndex++;
+      this.indexMap.set(sdkIndex, index);
       const block = this.startBlock(raw);
       this.blocks.set(index, { block, partialJson: "", isToolUse: block.type === "tool_use" });
       if (block.type === "tool_use") this.sawToolUse = true;
@@ -118,17 +145,21 @@ export class MessageAssembler {
     }
 
     if (type === "content_block_delta") {
-      const index = Number(event.index ?? -1);
+      const sdkIndex = Number(event.index ?? -1);
+      if (this.suppressed.has(sdkIndex)) return;
+      const index = this.indexMap.get(sdkIndex) ?? sdkIndex;
       const delta = (event.delta ?? {}) as Record<string, unknown>;
       this.applyDelta(index, delta);
-      this.emit(event);
+      this.emit({ ...event, index });
       return;
     }
 
     if (type === "content_block_stop") {
-      const index = Number(event.index ?? -1);
+      const sdkIndex = Number(event.index ?? -1);
+      if (this.suppressed.has(sdkIndex)) return;
+      const index = this.indexMap.get(sdkIndex) ?? sdkIndex;
       this.finishBlock(index);
-      this.emit(event);
+      this.emit({ ...event, index });
       return;
     }
 
@@ -143,6 +174,14 @@ export class MessageAssembler {
       }
       this.usage = { ...this.usage, ...usageOf(event.usage) };
       this.emit(event);
+      // A completed tool_use message is the end of this API turn. Stop here,
+      // before the CLI executes the tool (it is denied anyway) or starts a
+      // second model call. The CLI's own message_stop follows; we synthesize
+      // it now so the stream is complete.
+      if (this.sawToolUse && this.stopReason === "tool_use" && !this.sawMessageStop) {
+        this.sawMessageStop = true;
+        this.emit({ type: "message_stop" });
+      }
       return;
     }
 
@@ -220,7 +259,14 @@ export class MessageAssembler {
             .join("\n")
         : "";
       if (text) {
+        // Hitting the output-token ceiling is a normal response boundary,
+        // not a request failure. Keep whatever content was streamed.
+        if (/exceeded .*output token|max_output_tokens|max_tokens/i.test(text)) {
+          this.stopReason = "max_tokens";
+          return;
+        }
         this.resultError = { type: classifySynthetic(text), message: text };
+        this.fatalError = true;
         return;
       }
     }
@@ -249,6 +295,11 @@ export class MessageAssembler {
         }
         return block as unknown as ContentBlock;
       });
+      if (!this.includeThinking) {
+        this.content = this.content.filter(
+          (block) => block.type !== "thinking" && block.type !== "redacted_thinking",
+        );
+      }
     }
   }
 

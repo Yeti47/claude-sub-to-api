@@ -99,20 +99,20 @@ export class ModelCatalog {
         }),
       ]);
       if (!models) return [];
-      const seen = new Set<string>();
-      const rows: ModelRow[] = [];
+      const byId = new Map<string, ModelRow>();
       for (const model of models) {
         const id = model.resolvedModel || model.value;
-        if (!id || seen.has(id)) continue;
-        seen.add(id);
-        rows.push({
+        if (!id) continue;
+        const row: ModelRow = {
           type: "model",
           id,
           display_name: model.displayName || id,
           created_at: CREATED_AT,
-        });
+        };
+        // Prefer a concrete alias's display name over "Default (recommended)".
+        if (!byId.has(id) || model.value !== "default") byId.set(id, row);
       }
-      return rows;
+      return [...byId.values()];
     } finally {
       if (timer) clearTimeout(timer);
       release();

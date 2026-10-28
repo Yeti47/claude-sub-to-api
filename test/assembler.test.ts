@@ -114,3 +114,53 @@ test("falls back to complete assistant messages without partial events", () => {
     input: { q: 1 },
   });
 });
+
+test("drops thinking blocks when thinking was not requested and remaps indices", () => {
+  const events: Record<string, unknown>[] = [];
+  const assembler = new MessageAssembler(
+    "claude-haiku-5-5",
+    undefined,
+    (event) => events.push(event),
+    false,
+  );
+
+  assembler.handle({
+    type: "stream_event",
+    event: { type: "message_start", message: { id: "msg_4", usage: { input_tokens: 1 } } },
+  });
+  assembler.handle({
+    type: "stream_event",
+    event: {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "thinking", thinking: "", signature: "" },
+    },
+  });
+  assembler.handle({
+    type: "stream_event",
+    event: { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "" } },
+  });
+  assembler.handle({ type: "stream_event", event: { type: "content_block_stop", index: 0 } });
+  assembler.handle({
+    type: "stream_event",
+    event: { type: "content_block_start", index: 1, content_block: { type: "text", text: "" } },
+  });
+  assembler.handle({
+    type: "stream_event",
+    event: { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "Red" } },
+  });
+  assembler.handle({ type: "stream_event", event: { type: "content_block_stop", index: 1 } });
+  assembler.handle({
+    type: "stream_event",
+    event: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+  });
+
+  const response = assembler.response();
+  assert.deepEqual(response.content, [{ type: "text", text: "Red" }]);
+  const types = events.map((event) => String(event.type));
+  assert.ok(!types.includes("thinking_delta"));
+  const textStart = events.find(
+    (event) => event.type === "content_block_start" && (event.content_block as { type?: string }).type === "text",
+  ) as { index?: number } | undefined;
+  assert.equal(textStart?.index, 0);
+});

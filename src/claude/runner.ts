@@ -93,6 +93,10 @@ export class ClaudeRunner {
     env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(maxTokens);
     env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
     env.CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH = "8192";
+    // The API client owns retries. Hidden CLI retries would produce several
+    // model messages for one API request, which cannot be represented as one
+    // Anthropic response (especially in a stream).
+    if (!env.CLAUDE_CODE_MAX_RETRIES) env.CLAUDE_CODE_MAX_RETRIES = "0";
     // The CLI is driven by an API client, not a terminal user.
     delete env.ANTHROPIC_API_KEY;
     delete env.ANTHROPIC_AUTH_TOKEN;
@@ -164,8 +168,19 @@ export class ClaudeRunner {
     if (this.config.pathToClaudeCodeExecutable) {
       options.pathToClaudeCodeExecutable = this.config.pathToClaudeCodeExecutable;
     }
+    // The CLI hides reasoning by default; when the client asked for thinking,
+    // ask for summaries so the thinking blocks are not empty.
+    if (request.thinking?.type === "enabled" || request.thinking?.type === "adaptive") {
+      options.settings = { showThinkingSummaries: true };
+      options.extraArgs = { "thinking-display": "summarized" };
+    }
 
-    const assembler = new MessageAssembler(request.model, bridge, stream ? onEvent : undefined);
+    const assembler = new MessageAssembler(
+      request.model,
+      bridge,
+      stream ? onEvent : undefined,
+      request.thinking?.type === "enabled" || request.thinking?.type === "adaptive",
+    );
     const handle = this.queryFn({ prompt: singlePrompt(prepared.prompt), options });
     let internalStop = false;
     let lastMessage: Record<string, unknown> | undefined;
@@ -177,6 +192,10 @@ export class ClaudeRunner {
           requestId,
           type: lastMessage.type,
           subtype: lastMessage.subtype,
+          event:
+            lastMessage.type === "stream_event"
+              ? (lastMessage.event as { type?: unknown } | undefined)?.type
+              : undefined,
         });
         assembler.handle(message);
         if (assembler.sawToolUse && assembler.sawMessageStop) {
@@ -202,6 +221,9 @@ export class ClaudeRunner {
       }
     }
 
+    if (assembler.fatalError && assembler.resultError) {
+      throw errorFor(assembler.resultError);
+    }
     if (assembler.resultError && assembler.content.length === 0) {
       throw errorFor(assembler.resultError);
     }
@@ -209,6 +231,10 @@ export class ClaudeRunner {
       assembler.content = [{ type: "text", text: lastMessage.result }];
     }
     if (assembler.content.length === 0) {
+      // A max_tokens or refusal stop can legitimately have no content.
+      if (assembler.stopReason === "max_tokens" || assembler.stopReason === "refusal") {
+        return assembler.response();
+      }
       throw new ApiError(502, "api_error", "Claude Code returned an empty response");
     }
     return assembler.response();

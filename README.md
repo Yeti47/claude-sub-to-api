@@ -129,6 +129,7 @@ All configuration is environment-based.
 | `DEFAULT_MAX_TOKENS` | `8192` | Output ceiling when `max_tokens` is omitted (the Messages API requires it). |
 | `CLAUDE_CWD` | process cwd | Working directory for the CLI. No project settings are loaded. |
 | `CLAUDE_CODE_EXECUTABLE` | SDK default | Path to a specific Claude Code executable. |
+| `CLAUDE_CODE_MAX_RETRIES` | `0` | CLI API retries. Keep `0` so one API request maps to one model response; clients own retries. |
 
 ## Migrating from v1
 
@@ -143,6 +144,8 @@ All configuration is environment-based.
 - No OAuth token endpoint calls, keepalive endpoints, or header/identity spoofing. The CLI owns authentication and refresh, so keepalive is unnecessary.
 - No cross-request Claude session resume: each request is stateless and replays history. This is simple and correct, but does not keep Anthropic's prompt cache warm between requests.
 - Sampling parameters (`temperature`, `top_p`, `top_k`) and `stop_sequences` are not exposed by the Agent SDK and are ignored. `max_tokens` sets the CLI's output ceiling.
+- Thinking blocks are returned only when the request asks for thinking. Some models reason internally even when it is off; those blocks are dropped.
+- Images and documents are passed through as native content blocks. An unprocessable attachment becomes a `400 invalid_request_error`.
 - `metadata` is accepted but not forwarded.
 - One Claude Code process is started per request. The first token latency includes process startup; memory use is roughly a few hundred MB per concurrent request.
 
