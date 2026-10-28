@@ -1,0 +1,133 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { ClaudeRunner, ApiError } from "../src/claude/runner.js";
+import { createLogger } from "../src/logger.js";
+import type { Config } from "../src/config.js";
+
+const config: Config = {
+  listenAddr: ":0",
+  proxyApiKey: "secret",
+  claudeConfigDir: "/tmp/claude-test",
+  credentialsPath: "/tmp/claude-test/.credentials.json",
+  cwd: process.cwd(),
+  logLevel: "error",
+  maxConcurrency: 1,
+  requestTimeoutMs: 60_000,
+  defaultMaxTokens: 100,
+};
+
+function fakeQuery(messages: unknown[], capture?: (options: Record<string, unknown>) => void) {
+  return (params: { options: Record<string, unknown> }) => {
+    capture?.(params.options);
+    return {
+      async *[Symbol.asyncIterator]() {
+        for (const message of messages) yield message;
+      },
+      close() {},
+    };
+  };
+}
+
+const textEvents = [
+  { type: "stream_event", event: { type: "message_start", message: { id: "msg_9", usage: { input_tokens: 4 } } } },
+  { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } },
+  { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } } },
+  { type: "stream_event", event: { type: "content_block_stop", index: 0 } },
+  { type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } } },
+  { type: "stream_event", event: { type: "message_stop" } },
+  { type: "result", subtype: "success", is_error: false, result: "ok", stop_reason: "end_turn", usage: { input_tokens: 4, output_tokens: 1 } },
+];
+
+test("runs a text turn and configures a constrained SDK session", async () => {
+  let options: Record<string, unknown> | undefined;
+  const runner = new ClaudeRunner(
+    config,
+    createLogger("error"),
+    fakeQuery(textEvents, (value) => (options = value)) as never,
+  );
+  const result = await runner.run({
+    request: {
+      model: "claude-sonnet-5-5",
+      max_tokens: 16,
+      system: "Be brief.",
+      messages: [{ role: "user", content: "hi" }],
+    },
+    signal: new AbortController().signal,
+    requestId: "r1",
+    stream: false,
+  });
+
+  assert.equal(result.content[0]?.type, "text");
+  assert.equal(result.stop_reason, "end_turn");
+  assert.equal(options?.systemPrompt, "Be brief.");
+  assert.deepEqual(options?.tools, []);
+  assert.equal(options?.permissionMode, "dontAsk");
+  assert.equal(options?.maxTurns, 1);
+  assert.equal(options?.persistSession, false);
+  assert.deepEqual(options?.settingSources, []);
+  assert.equal((options?.env as Record<string, string>).CLAUDE_CODE_MAX_OUTPUT_TOKENS, "16");
+  assert.equal((options?.env as Record<string, string>).CLAUDE_CONFIG_DIR, "/tmp/claude-test");
+});
+
+test("stops after a tool_use turn and maps the tool name", async () => {
+  const runner = new ClaudeRunner(
+    config,
+    createLogger("error"),
+    fakeQuery([
+      { type: "stream_event", event: { type: "message_start", message: { id: "msg_10", usage: { input_tokens: 4 } } } },
+      {
+        type: "stream_event",
+        event: {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "tool_use", id: "t1", name: "mcp__proxy__lookup" },
+        },
+      },
+      { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"q":"x"}' } } },
+      { type: "stream_event", event: { type: "content_block_stop", index: 0 } },
+      { type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 2 } } },
+      { type: "stream_event", event: { type: "message_stop" } },
+    ]) as never,
+  );
+  const streamed: string[] = [];
+  const result = await runner.run({
+    request: {
+      model: "claude-sonnet-5-5",
+      messages: [{ role: "user", content: "find x" }],
+      tools: [{ name: "lookup", input_schema: { type: "object", properties: { q: { type: "string" } } } }],
+    },
+    signal: new AbortController().signal,
+    requestId: "r2",
+    stream: true,
+    onEvent: (event) => streamed.push(String(event.type)),
+  });
+
+  assert.equal(result.stop_reason, "tool_use");
+  assert.deepEqual(result.content[0], {
+    type: "tool_use",
+    id: "t1",
+    name: "lookup",
+    input: { q: "x" },
+  });
+  assert.ok(streamed.includes("content_block_start"));
+});
+
+test("turns an SDK rate-limit result into a 429", async () => {
+  const runner = new ClaudeRunner(
+    config,
+    createLogger("error"),
+    fakeQuery([
+      { type: "result", subtype: "error_during_execution", is_error: true, errors: ["rate_limit"], stop_reason: null, usage: {} },
+    ]) as never,
+  );
+  await assert.rejects(
+    () =>
+      runner.run({
+        request: { model: "m", messages: [{ role: "user", content: "hi" }] },
+        signal: new AbortController().signal,
+        requestId: "r3",
+        stream: false,
+      }),
+    (error: unknown) => error instanceof ApiError && error.status === 429,
+  );
+});

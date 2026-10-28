@@ -1,43 +1,66 @@
 # claude-sub-to-api
 
-A small Dockerized Go proxy that lets you use a **Claude subscription** (Max/Pro) through an **Anthropic-compatible HTTP API** — so any agent harness that expects an Anthropic API key can run on your subscription instead.
+An **Anthropic Messages API-compatible HTTP server** backed by a **Claude subscription** (Pro/Max), using Anthropic's official [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk).
 
-The proxy does **not** perform the OAuth login itself. You authenticate externally (Claude Code CLI or the VS Code extension), which writes `~/.claude/.credentials.json`, and you drop that file into the proxy's data volume. The proxy keeps the token refreshed automatically.
+Version 2 is a TypeScript rewrite. It no longer reverse-engineers Claude Code's HTTP requests or fakes its headers. Instead it runs the official Claude Code CLI through the Agent SDK; the CLI owns authentication, OAuth refresh, and the conversation with Anthropic.
+
+```
+your agent / SDK
+  │  Anthropic Messages API (/v1/messages)
+  ▼
+claude-sub-to-api  (Node.js)
+  │  Claude Agent SDK query()
+  ▼
+Claude Code CLI  (your login, your plan)
+  │
+  ▼
+Anthropic
+```
 
 ## How it works
 
-1. You log in with Claude Code (`claude login`) or the VS Code extension → this writes `~/.claude/.credentials.json`.
-2. You copy that file into the proxy's data volume.
-3. The proxy serves `POST /v1/messages` (streaming + non-streaming) and `GET /v1/models`, injecting your OAuth token and the required `anthropic-beta` headers, forwarding to `https://api.anthropic.com`, and refreshing the token transparently.
-4. Consumers authenticate to the proxy with a single static API key (`PROXY_API_KEY`).
+- `POST /v1/messages` turns the Messages API request into one Agent SDK turn. The client's system prompt replaces Claude Code's prompt, built-in tools are disabled, project settings/skills/MCP servers are not loaded, and the session is not persisted.
+- Conversation history is replayed as a transcript on every request (the server is stateless). The final user turn, including images and documents, is passed through natively.
+- Client-defined `tools` are exposed to Claude as an in-process MCP server. When Claude calls one, the server returns a normal `tool_use` block and stops the turn. The client executes the tool and sends a follow-up request containing `tool_result`.
+- `GET /v1/models` asks the signed-in CLI which models the account can use.
+- Authentication is the CLI's own: a `.credentials.json` in a Claude config directory. The CLI refreshes the token in place.
 
-## Quick start
+## Requirements
 
-```bash
-# 1. Authenticate externally (one of):
-claude login                                   # Claude Code CLI
-# or sign in via the Claude VS Code extension
+- Node.js 20+ (the Docker image uses Node 24).
+- A Claude Pro/Max subscription, signed in with the Claude Code CLI. The SDK bundles a compatible Claude Code binary, so a separate install is optional.
+- The server is intended for personal, small-scale use. Do not expose it to the internet.
 
-# 2. Copy your credentials into the proxy data directory
-mkdir -p ~/.config/claude-sub-to-api
-cp ~/.claude/.credentials.json ~/.config/claude-sub-to-api/.credentials.json
-chmod 600 ~/.config/claude-sub-to-api/.credentials.json
+## Quick start (Docker)
 
-# 3. Configure the consumer API key and host UID/GID (needed so the
-#    container can read the bind-mounted credentials file)
-cp .env.example .env
-# edit .env – set PROXY_API_KEY and HOST_UID/HOST_GID (run id -u / id -g)
+1. Sign in with Claude Code (on the host, once):
 
-# 4. Run
-docker compose up -d --build
-```
+   ```bash
+   claude auth login --claudeai
+   # check with: claude auth status
+   ```
 
-If you keep the credentials elsewhere, update the bind-mount path in
-`docker-compose.yml` (the `volumes:` section) to point to your directory.
+2. Give the proxy its own Claude config directory containing the credentials:
+
+   ```bash
+   mkdir -p ~/.config/claude-sub-to-api
+   cp ~/.claude/.credentials.json ~/.config/claude-sub-to-api/.credentials.json
+   chmod 600 ~/.config/claude-sub-to-api/.credentials.json
+   ```
+
+3. Configure and start:
+
+   ```bash
+   cp .env.example .env
+   # set PROXY_API_KEY, HOST_UID and HOST_GID (id -u / id -g)
+   docker compose up -d --build
+   ```
+
+The container mounts `~/.config/claude-sub-to-api` at `/data` and uses it as `CLAUDE_CONFIG_DIR`. That directory must stay writable: the CLI writes refreshed tokens and its config file there.
+
+> **Credential copies:** an OAuth refresh rotates the refresh token. A host-side copy of the same credentials becomes stale once the proxy refreshes it. While the proxy runs, let it own that copy; after signing in again on the host, copy the file over again.
 
 ## Usage
-
-Point any Anthropic-compatible client at the proxy. For example with `curl`:
 
 ```bash
 export PROXY_API_KEY=your-key
@@ -47,14 +70,13 @@ curl http://localhost:8080/v1/messages \
   -H "content-type: application/json" \
   -H "x-api-key: $PROXY_API_KEY" \
   -H "anthropic-version: 2023-06-01" \
-  -d '{"model":"claude-opus-4-8","max_tokens":64,"messages":[{"role":"user","content":"Say hi in one word."}]}'
+  -d '{"model":"claude-opus-5-5","max_tokens":64,"messages":[{"role":"user","content":"Say hi in one word."}]}'
 
 # Streaming
-curl http://localhost:8080/v1/messages \
+curl -N http://localhost:8080/v1/messages \
   -H "content-type: application/json" \
   -H "x-api-key: $PROXY_API_KEY" \
-  -H "anthropic-version: 2023-06-01" \
-  -d '{"model":"claude-opus-4-8","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"Count to three."}]}'
+  -d '{"model":"claude-opus-5-5","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"Count to three."}]}'
 
 # Models
 curl http://localhost:8080/v1/models -H "x-api-key: $PROXY_API_KEY"
@@ -63,160 +85,84 @@ curl http://localhost:8080/v1/models -H "x-api-key: $PROXY_API_KEY"
 curl http://localhost:8080/healthz
 ```
 
-For SDKs / agent harnesses, set:
+For SDKs and agent harnesses:
 
 ```
 ANTHROPIC_BASE_URL=http://localhost:8080
 ANTHROPIC_API_KEY=<your PROXY_API_KEY>
 ```
 
-The consumer key is accepted as `Authorization: Bearer <key>` or `x-api-key: <key>`.
+The consumer key is accepted as `x-api-key: <key>` or `Authorization: Bearer <key>`.
 
 ## Endpoints
 
-| Method | Path                    | Auth | Description                                   |
-|--------|-------------------------|------|-----------------------------------------------|
-| POST   | `/v1/messages`          | yes  | Anthropic Messages API (stream + non-stream). |
-| GET    | `/v1/models`            | yes  | Model list (proxied from upstream).           |
-| GET    | `/v1/keepalive`         | yes  | One-shot forced token rotation (pulse).       |
-| POST   | `/v1/keepalive/auto`    | yes  | Enable auto-keepalive (idempotent).           |
-| DELETE | `/v1/keepalive/auto`    | yes  | Disable auto-keepalive (idempotent).          |
-| GET    | `/healthz`              | no   | Liveness probe. Reports 503 if the token is missing or invalid. |
+| Method | Path           | Auth | Description |
+|--------|----------------|------|-------------|
+| POST   | `/v1/messages` | yes  | Anthropic Messages API, streaming and non-streaming. |
+| GET    | `/v1/models`   | yes  | Models reported by the signed-in CLI (cached 10 minutes). |
+| GET    | `/healthz`     | no   | 200 when a credential is present, 503 otherwise. |
+| GET    | `/`            | no   | Name/version metadata. |
 
-## Keepalive
+## Tools
 
-Normal request handling refreshes the OAuth token **lazily**: only when a
-request needs it and the token is within `REFRESH_LEEWAY` of expiring.
-Keepalive is different — every pulse performs a **real token rotation** at the
-OAuth token endpoint (`https://console.anthropic.com/v1/oauth/token`),
-**independent of `REFRESH_LEEWAY`**. This keeps the token and its refresh-token
-chain perpetually fresh even while the proxy is completely idle (e.g. to keep
-an external re-auth session alive).
+Tools are always executed by the client, never by the proxy. Send definitions in `tools`; Claude's calls come back as `tool_use` blocks with `stop_reason: "tool_use"`. Append the assistant message and a `user` message containing `tool_result` blocks to the next request.
 
-Two options:
+Tool names are translated to MCP-safe names internally and mapped back in responses, so clients see their original names and schemas.
 
-- **One-shot pulse** — `GET /v1/keepalive` forces a single token rotation
-  (returns `503` if the rotation fails). Useful for cron/Uptime-Kuma style
-  schedulers. It also reports when the token should be rotated again.
-- **Auto-keepalive** — a background goroutine forces a rotation immediately on
-  enable, then self-schedules: each rotation reports the timestamp at which the
-  next one should happen (the token's expiry minus `REFRESH_LEEWAY`, already
-  factored in), so the cadence follows the token's own lifetime rather than a
-  fixed interval. It can be enabled at startup via `AUTO_KEEPALIVE=true`, or
-  toggled at runtime:
-
-  ```bash
-  export PROXY_API_KEY=your-key
-
-  # Enable (idempotent)
-  curl -X POST http://localhost:8080/v1/keepalive/auto -H "x-api-key: $PROXY_API_KEY"
-
-  # Status / one-shot pulse
-  curl http://localhost:8080/v1/keepalive -H "x-api-key: $PROXY_API_KEY"
-
-  # Disable (idempotent)
-  curl -X DELETE http://localhost:8080/v1/keepalive/auto -H "x-api-key: $PROXY_API_KEY"
-  ```
-
-  All three endpoints return `{"status":"ok","auto_keepalive":<bool>}`; the
-  pulse response also includes `next_refresh_at` (RFC3339), the time at which
-  the token should be rotated again.
-
-> **Note:** every pulse hits the OAuth token endpoint and issues a fresh access
-> token plus a brand-new refresh token, invalidating the previous refresh
-> token. If another process (e.g. Claude Code CLI) shares the same credentials
-> file, each rotation can invalidate that process's refresh token — an
-> unavoidable consequence of keeping the session perpetually fresh.
+`tool_choice` is supported as follows: `none` hides tools, `auto` is the normal behavior, and `any` / `tool` add a strong instruction but cannot force the underlying CLI's tool-selection mode.
 
 ## Configuration
 
-All configuration is via environment variables.
+All configuration is environment-based.
 
-| Variable            | Default                     | Description                                            |
-|---------------------|-----------------------------|--------------------------------------------------------|
-| `PROXY_API_KEY`     | — (required)                | Static key consumers must present.                     |
-| `LISTEN_ADDR`       | `:8080`                     | Address the server binds to.                           |
-| `UPSTREAM_BASE_URL` | `https://api.anthropic.com` | Anthropic API base URL.                                |
-| `CREDENTIALS_PATH`  | `/data/.credentials.json`   | Path to the externally-generated credentials file.     |
-| `CLAUDE_CREDENTIALS_JSON` | —                    | Full JSON content of `~/.claude/.credentials.json`, for serverless deployments (Azure ACA, etc.) with no writable credentials file. Takes precedence over `CREDENTIALS_PATH` when set. |
-| `LOG_LEVEL`         | `info`                      | `debug`, `info`, `warn`, or `error`.                   |
-| `CLAUDE_UA`         | `claude-cli/2.1.44`         | User-Agent sent to the upstream API.                   |
-| `REFRESH_LEEWAY`    | `60s`                       | How long before token expiry a refresh is triggered.   |
-| `AUTO_KEEPALIVE`    | `false`                     | Start the auto-keepalive goroutine at boot (`true`/`1`).|
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROXY_API_KEY` | — (required) | Static key consumers present. |
+| `LISTEN_ADDR` | `:8080` | Bind address. |
+| `CREDENTIALS_PATH` | `/data/.credentials.json` | Credentials file; its directory becomes the Claude config dir. |
+| `CLAUDE_CONFIG_DIR` | dirname of `CREDENTIALS_PATH` | Explicit Claude Code config directory. |
+| `CLAUDE_CREDENTIALS_JSON` | — | Full credentials JSON, written to a temporary config dir. Takes precedence over `CREDENTIALS_PATH`. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | — | Long-lived token from `claude setup-token`, instead of a credentials file. |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
+| `MAX_CONCURRENCY` | `4` | Maximum simultaneous Claude Code processes. |
+| `REQUEST_TIMEOUT_MS` | `900000` | Per-request upper bound. |
+| `DEFAULT_MAX_TOKENS` | `8192` | Output ceiling when `max_tokens` is omitted (the Messages API requires it). |
+| `CLAUDE_CWD` | process cwd | Working directory for the CLI. No project settings are loaded. |
+| `CLAUDE_CODE_EXECUTABLE` | SDK default | Path to a specific Claude Code executable. |
 
-The auto-keepalive cadence is not configured: each rotation reports when the
-next one should happen (expiry minus `REFRESH_LEEWAY`), so it follows the
-token's own lifetime.
+## Migrating from v1
 
-## Token refresh & re-auth
+- Keep `PROXY_API_KEY`, `CREDENTIALS_PATH` and `CLAUDE_CREDENTIALS_JSON`; they mean the same thing.
+- `UPSTREAM_BASE_URL`, `CLAUDE_UA`, `REFRESH_LEEWAY`, and `AUTO_KEEPALIVE` are gone. The SDK talks to Anthropic itself and the CLI refreshes the token.
+- The `/v1/keepalive` endpoints are gone. They existed only to keep the reverse-engineered OAuth token chain warm.
+- The container now needs a writable Claude config directory, not just a readable credentials file, because the CLI writes refreshed tokens there.
+- Model IDs are whatever your account's CLI reports. `GET /v1/models` is authoritative.
 
-- The proxy refreshes the OAuth access token automatically before it expires and writes the rotated credentials back to the file.
-- If you re-run `claude login` externally while the proxy is running, the proxy detects the changed file and picks up the new credentials without a restart.
+## Differences from v1 / limitations
 
-## Serverless deployments (env-var credentials)
-
-For serverless containers without a writable credentials file (e.g. Azure
-Container Apps), you can pass the entire contents of
-`~/.claude/.credentials.json` via the `CLAUDE_CREDENTIALS_JSON` env var. When
-set, it takes precedence over `CREDENTIALS_PATH` and no data volume is needed:
-
-```bash
-CLAUDE_CREDENTIALS_JSON='{"claudeAiOauth":{"accessToken":"sk-ant-oat...","refreshToken":"sk-ant-ort...","expiresAt":1893456000000}}' \
-  PROXY_API_KEY=dev-key go run ./cmd/claude-sub-to-api
-```
-
-Notes:
-- Set it directly from the file: `CLAUDE_CREDENTIALS_JSON="$(cat ~/.claude/.credentials.json)"`.
-- Refreshed tokens are rotated **in memory only** — they are not written back
-  to the env var. If the container restarts, it will use the original tokens
-  from the env var again (the access token is simply re-refreshed on demand).
-- File re-auth detection does not apply; restart the container with updated env
-  vars to pick up new credentials.
+- No OAuth token endpoint calls, keepalive endpoints, or header/identity spoofing. The CLI owns authentication and refresh, so keepalive is unnecessary.
+- No cross-request Claude session resume: each request is stateless and replays history. This is simple and correct, but does not keep Anthropic's prompt cache warm between requests.
+- Sampling parameters (`temperature`, `top_p`, `top_k`) and `stop_sequences` are not exposed by the Agent SDK and are ignored. `max_tokens` sets the CLI's output ceiling.
+- `metadata` is accepted but not forwarded.
+- One Claude Code process is started per request. The first token latency includes process startup; memory use is roughly a few hundred MB per concurrent request.
 
 ## Local development
 
 ```bash
-# Build
-go build ./...
+npm ci
+npm run build
+npm test
+npm run typecheck
 
-# Vet + tests
-go vet ./...
-go test ./...
-
-# Run locally (needs a credentials file)
-PROXY_API_KEY=dev-key CREDENTIALS_PATH=~/.claude/.credentials.json go run ./cmd/claude-sub-to-api
+# Run locally against a credentials file
+PROXY_API_KEY=dev-key \
+  CREDENTIALS_PATH=$HOME/.claude/.credentials.json \
+  LOG_LEVEL=debug \
+  npm run dev
 ```
-
-## Integration tests (Bifrost gateway)
-
-There's an end-to-end integration test that runs the proxy against a real
-[Bifrost](https://github.com/maximhq/bifrost) gateway (in Docker) that is
-configured to use the proxy as its Anthropic provider, with a **virtual key**
-(governance) — mirroring a real Bifrost harness setup. It exercises both the
-unified OpenAI-compatible surface (`/v1/chat/completions` with
-`anthropic/<model>`) and the native Anthropic surface
-(`/anthropic/v1/messages`).
-
-Each surface is tested in **non-streaming** and **streaming** (`stream: true`)
-modes, so SSE forwarding is covered end to end.
-
-Prerequisites: `docker`, and your Claude subscription credentials file. The
-test skips itself if either is missing.
-
-```bash
-CLAUDE_CREDENTIALS_PATH=~/.config/claude-sub-to-api/.credentials.json \
-  go test -tags integration ./internal/proxy -run TestBifrostIntegration -v -timeout 20m
-```
-
-The test pulls `maximhq/bifrost:latest` on first run and downloads the model
-catalog, so the first run can take a few minutes; subsequent runs are faster.
 
 ## Disclaimer
 
-**This is an unofficial, community-maintained project.** It is **not** created by, endorsed by, sponsored by, or affiliated with Anthropic PBC or claude.ai in any way. "Claude" and "Anthropic" are trademarks of Anthropic PBC.
+**This is an unofficial, community-maintained project.** It is not created, endorsed, sponsored by, or affiliated with Anthropic PBC. "Claude", "Claude Code", and "Anthropic" are trademarks of Anthropic PBC.
 
-This project is intended for **small-scale, experimental, and research purposes only** — e.g. prototyping tool integrations, exploring agent architectures, or personal tinkering. It is **not** designed for production workloads, high-throughput usage, or anything that would compete with Anthropic's own API offerings.
-
-This tool proxies your personal Claude subscription through Anthropic's OAuth flow. **We strongly advise you to review and comply with [Anthropic's Terms of Service](https://www.anthropic.com/legal/terms) and [Acceptable Use Policy](https://www.anthropic.com/legal/aup) before using this software.** Use it only for personal, permitted purposes — any usage that violates Anthropic's terms is your own responsibility.
-
-If you need reliable, scalable programmatic access to Claude, you should acquire the appropriate API license directly from Anthropic. See [Anthropic's API plans & pricing](https://www.anthropic.com/pricing) to choose the tier that fits your needs.
+Anthropic documents third-party use of the Claude Agent SDK with a Claude plan in [Use the Claude Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan). Such usage counts toward your plan's limits, and Anthropic has said billing for third-party apps may change. Review [Anthropic's Terms of Service](https://www.anthropic.com/legal/terms) and [Acceptable Use Policy](https://www.anthropic.com/legal/aup), and use this only for personal, permitted purposes. You are responsible for your own account.

@@ -1,25 +1,36 @@
-# ---- Build stage ----
-FROM golang:1.26-alpine AS build
-WORKDIR /src
+# ---- Dependencies + build ----
+FROM node:24-bookworm-slim AS build
+WORKDIR /app
 
-# Cache dependencies first.
-COPY go.mod go.sum ./
-RUN go mod download
+COPY package.json package-lock.json ./
+RUN npm ci
 
-# Build a static binary.
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
-    -o /out/claude-sub-to-api ./cmd/claude-sub-to-api
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
 
-# ---- Runtime stage ----
-FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /out/claude-sub-to-api /claude-sub-to-api
+# ---- Production dependencies ----
+FROM node:24-bookworm-slim AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
 
-# Run as the nonroot user provided by the base image.
-USER nonroot:nonroot
+# ---- Runtime ----
+FROM node:24-bookworm-slim
+ENV NODE_ENV=production
+WORKDIR /app
 
-# The proxy expects its data dir (containing .credentials.json) at /data by default.
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY package.json ./
+
+USER node
+
+# Claude Code keeps its login and refreshes the OAuth token here.
 VOLUME ["/data"]
-
 EXPOSE 8080
-ENTRYPOINT ["/claude-sub-to-api"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+ENTRYPOINT ["node", "dist/index.js"]
