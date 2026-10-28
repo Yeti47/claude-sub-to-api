@@ -5,20 +5,17 @@ services:
     container_name: claude-sub-to-api
     restart: unless-stopped
     init: true
-    # Run as the host user so the bind-mounted Claude config directory stays
-    # readable and the CLI can write refreshed OAuth tokens back to it.
+    # Run as the host user so the bind-mounted Claude config directory (the
+    # onboarding file and session transcripts) is writable.
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     ports:
       - "8080:8080"
     environment:
       LISTEN_ADDR: ":8080"
       PROXY_API_KEY: ${PROXY_API_KEY:?set PROXY_API_KEY in .env}
-      # The directory contains .credentials.json (written by `claude auth login`).
-      CREDENTIALS_PATH: "/data/.credentials.json"
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:?set CLAUDE_CODE_OAUTH_TOKEN in .env}
+      # Holds .claude.json (onboarding flag) and session transcripts.
       CLAUDE_CONFIG_DIR: "/data"
-      # Serverless alternative: set this to the full credentials JSON and
-      # remove the /data volume below.
-      # CLAUDE_CREDENTIALS_JSON: ${CLAUDE_CREDENTIALS_JSON:-}
       LOG_LEVEL: "info"
       MAX_CONCURRENCY: "4"
       REQUEST_TIMEOUT_MS: "900000"

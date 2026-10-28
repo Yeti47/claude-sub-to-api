@@ -1,8 +1,8 @@
 # claude-sub-to-api
 
-An **Anthropic Messages API-compatible HTTP server** backed by a **Claude subscription** (Pro/Max), using Anthropic's official [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk).
+An **Anthropic Messages API-compatible HTTP server** backed by a **Claude subscription** (Pro/Max), running the official Claude Code CLI through Anthropic's [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk).
 
-A TypeScript server built on the official [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk). It runs the official Claude Code CLI; the CLI owns authentication, OAuth refresh, and the conversation with Anthropic.
+The only credential is a long-lived `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. The proxy does not read, copy, or refresh `.credentials.json` files.
 
 ```
 your agent / SDK
@@ -11,7 +11,7 @@ your agent / SDK
 claude-sub-to-api  (Node.js)
   │  Claude Agent SDK query()
   ▼
-Claude Code CLI  (your login, your plan)
+Claude Code CLI  (your setup-token, your plan)
   │
   ▼
 Anthropic
@@ -22,45 +22,46 @@ Anthropic
 - `POST /v1/messages` turns the Messages API request into one Agent SDK turn. Claude runs with its normal Claude Code harness prompt; the client's system prompt is appended as turn instructions and takes precedence for that request. Built-in tools are disabled, and project settings/skills/MCP servers are not loaded.
 - The model is told plainly that it runs in `claude-sub-to-api` through the Claude Code harness, and that the tools come from the API client. Nothing pretends to be the Anthropic API or hides the harness.
 - Each conversation is bound to a persisted Claude session when possible. Resuming it, together with `excludeDynamicSections`, keeps the harness prompt stable and produced real prompt-cache reads in testing.
-- Conversation history is replayed as a transcript on every request (the server is stateless). The final user turn, including images and documents, is passed through natively.
+- Conversation history is resumed from the bound Claude session when possible; otherwise it is replayed as a transcript. The final user turn, including images and documents, is passed through natively.
 - Client-defined `tools` are exposed to Claude as an in-process MCP server. When Claude calls one, the server returns a normal `tool_use` block and stops the turn. The client executes the tool and sends a follow-up request containing `tool_result`.
 - `GET /v1/models` asks the signed-in CLI which models the account can use.
-- Authentication is the CLI's own: a `.credentials.json` in a Claude config directory. The CLI refreshes the token in place.
+- Authentication is a single `CLAUDE_CODE_OAUTH_TOKEN`. The config directory only holds the CLI's onboarding flag, session transcripts, and local state.
 
 ## Requirements
 
 - Node.js 20+ (the Docker image uses Node 24).
-- A Claude Pro/Max subscription, signed in with the Claude Code CLI. The SDK bundles a compatible Claude Code binary, so a separate install is optional.
+- A Claude Pro/Max subscription and a token from `claude setup-token`. Run it once on a machine with browser access; no Claude Code login is needed on the proxy host.
 - The server is intended for personal, small-scale use. Do not expose it to the internet.
 
 ## Quick start (Docker)
 
-1. Sign in with Claude Code (on the host, once):
+1. Create a long-lived token on a machine with browser access:
 
    ```bash
-   claude auth login --claudeai
-   # check with: claude auth status
+   claude setup-token
+   # if the CLI is not installed: npm install -g @anthropic-ai/claude-code
    ```
 
-2. Give the proxy its own Claude config directory containing the credentials:
+   Complete the browser login and copy the token. It is reported to last about a year; run the command again when it expires.
+
+2. Configure the proxy:
 
    ```bash
    mkdir -p ~/.config/claude-sub-to-api
-   cp ~/.claude/.credentials.json ~/.config/claude-sub-to-api/.credentials.json
-   chmod 600 ~/.config/claude-sub-to-api/.credentials.json
+   cp .env.example .env
+   # set PROXY_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, HOST_UID and HOST_GID
+   # (run id -u / id -g for the UID/GID)
    ```
 
-3. Configure and start:
+3. Start it:
 
    ```bash
-   cp .env.example .env
-   # set PROXY_API_KEY, HOST_UID and HOST_GID (id -u / id -g)
    docker compose up -d --build
    ```
 
-The container mounts `~/.config/claude-sub-to-api` at `/data` and uses it as `CLAUDE_CONFIG_DIR`. That directory must stay writable: the CLI writes refreshed tokens and its config file there.
+The container mounts `~/.config/claude-sub-to-api` at `/data` and uses it as `CLAUDE_CONFIG_DIR`. The token is passed in the environment, not written to disk. The proxy writes `.claude.json` in that directory (`/data/.claude.json`) with `"hasCompletedOnboarding": true` so the CLI starts headlessly; the same directory also holds session transcripts used for resume. It must stay writable.
 
-> **Credential copies:** an OAuth refresh rotates the refresh token. A host-side copy of the same credentials becomes stale once the proxy refreshes it. While the proxy runs, let it own that copy; after signing in again on the host, copy the file over again.
+When `CLAUDE_CONFIG_DIR` is not set (for example in local development), the CLI keeps `.claude.json` in `$HOME` and its state in `~/.claude`; the proxy follows the same layout.
 
 ## Usage
 
@@ -154,11 +155,9 @@ All configuration is environment-based.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PROXY_API_KEY` | — (required) | Static key consumers present. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | — (required) | Long-lived token from `claude setup-token`. |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Writable directory for the CLI's `.claude.json`, session transcripts, and state. `/data` in Docker. |
 | `LISTEN_ADDR` | `:8080` | Bind address. |
-| `CREDENTIALS_PATH` | `/data/.credentials.json` | Credentials file; its directory becomes the Claude config dir. |
-| `CLAUDE_CONFIG_DIR` | dirname of `CREDENTIALS_PATH` | Explicit Claude Code config directory. |
-| `CLAUDE_CREDENTIALS_JSON` | — | Full credentials JSON, written to a temporary config dir. Takes precedence over `CREDENTIALS_PATH`. |
-| `CLAUDE_CODE_OAUTH_TOKEN` | — | Long-lived token from `claude setup-token`, instead of a credentials file. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 | `MAX_CONCURRENCY` | `4` | Maximum simultaneous Claude Code processes. |
 | `REQUEST_TIMEOUT_MS` | `900000` | Per-request upper bound. |
@@ -170,7 +169,7 @@ All configuration is environment-based.
 
 ## Limitations
 
-- Authentication and token refresh are owned by the Claude Code CLI.
+- Authentication is a long-lived `CLAUDE_CODE_OAUTH_TOKEN`; the proxy does not refresh or persist it.
 - Session resume is best-effort: a missing session file, a changed model/system prompt, edited history, or a tool-result turn falls back to replaying the transcript. Cache reads still depend on the CLI's own cache-breakpoint placement.
 - Sampling parameters (`temperature`, `top_p`, `top_k`) and `stop_sequences` are not exposed by the Agent SDK and are ignored. `max_tokens` sets the CLI's output ceiling; models that reason even with thinking disabled can spend part of that ceiling before answering, so the proxy gives short requests a 1024-token floor.
 - Thinking blocks are returned only when the request asks for thinking. Some models reason internally even when it is off; those blocks are dropped.
@@ -199,9 +198,9 @@ npm run build
 npm test
 npm run typecheck
 
-# Run locally against a credentials file
+# Run locally with a setup-token
 PROXY_API_KEY=dev-key \
-  CREDENTIALS_PATH=$HOME/.claude/.credentials.json \
+  CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-... \
   LOG_LEVEL=debug \
   npm run dev
 ```

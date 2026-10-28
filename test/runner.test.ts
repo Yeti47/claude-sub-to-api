@@ -8,7 +8,7 @@ const config: Config = {
   listenAddr: ":0",
   proxyApiKey: "secret",
   claudeConfigDir: "/tmp/claude-test",
-  credentialsPath: "/tmp/claude-test/.credentials.json",
+  claudeConfigDirExplicit: true,
   cwd: process.cwd(),
   logLevel: "error",
   maxConcurrency: 1,

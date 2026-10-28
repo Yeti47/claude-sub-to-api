@@ -142,7 +142,11 @@ export class ClaudeRunner {
     for (const [key, value] of Object.entries(process.env)) {
       if (value !== undefined) env[key] = value;
     }
-    if (this.config.claudeConfigDir) env.CLAUDE_CONFIG_DIR = this.config.claudeConfigDir;
+    if (this.config.claudeConfigDirExplicit) {
+      env.CLAUDE_CONFIG_DIR = this.config.claudeConfigDir;
+    } else {
+      delete env.CLAUDE_CONFIG_DIR;
+    }
     env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(maxTokens);
     env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
     env.CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH = "8192";

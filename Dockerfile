@@ -26,7 +26,7 @@ COPY package.json ./
 
 USER node
 
-# Claude Code keeps its login and refreshes the OAuth token here.
+# Claude Code keeps its onboarding file and session transcripts here.
 VOLUME ["/data"]
 EXPOSE 8080
 

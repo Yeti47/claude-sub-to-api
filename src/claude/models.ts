@@ -62,7 +62,11 @@ export class ModelCatalog {
     for (const [key, value] of Object.entries(process.env)) {
       if (value !== undefined) env[key] = value;
     }
-    if (this.config.claudeConfigDir) env.CLAUDE_CONFIG_DIR = this.config.claudeConfigDir;
+    if (this.config.claudeConfigDirExplicit) {
+      env.CLAUDE_CONFIG_DIR = this.config.claudeConfigDir;
+    } else {
+      delete env.CLAUDE_CONFIG_DIR;
+    }
 
     let release: () => void = () => {};
     const idle = (async function* () {

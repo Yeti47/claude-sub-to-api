@@ -1,12 +1,12 @@
 /**
- * Environment-based configuration for the v2 server.
+ * Environment-based configuration.
  *
- * Authentication is owned by the Claude Code CLI that the Agent SDK spawns.
- * We only point it at a config directory: either an existing CLAUDE_CONFIG_DIR,
- * a directory containing the usual `.credentials.json`, or the JSON payload
- * supplied inline for serverless deployments.
+ * Authentication uses one long-lived token from `claude setup-token`, passed
+ * as CLAUDE_CODE_OAUTH_TOKEN. The Claude Code CLI still needs a writable config
+ * directory for its onboarding file, sessions, and other local state.
  */
-import { dirname } from "node:path";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -14,11 +14,9 @@ export interface Config {
   listenAddr: string;
   proxyApiKey: string;
   /** Claude Code config directory passed to the SDK/CLI. */
-  claudeConfigDir?: string;
-  /** Inline credentials JSON, written to a temporary config dir at boot. */
-  credentialsJSON?: string;
-  /** Path to an existing credentials file (used to derive the config dir). */
-  credentialsPath: string;
+  claudeConfigDir: string;
+  /** Whether CLAUDE_CONFIG_DIR was supplied explicitly. */
+  claudeConfigDirExplicit: boolean;
   /** Working directory the CLI runs in. No project settings are loaded. */
   cwd: string;
   logLevel: LogLevel;
@@ -57,18 +55,22 @@ export function loadConfig(envVars: NodeJS.ProcessEnv = process.env): Config {
     );
   }
 
+  if (!envVars.CLAUDE_CODE_OAUTH_TOKEN?.trim()) {
+    throw new Error(
+      "CLAUDE_CODE_OAUTH_TOKEN is required. Run `claude setup-token` on a machine " +
+        "with browser access and put the token in the environment.",
+    );
+  }
+
   const rawLevel = (envVars.LOG_LEVEL?.trim().toLowerCase() || "info") as LogLevel;
   const logLevel = LEVELS.includes(rawLevel) ? rawLevel : "info";
-
-  const credentialsPath = envVars.CREDENTIALS_PATH?.trim() || "/data/.credentials.json";
   const explicitConfigDir = envVars.CLAUDE_CONFIG_DIR?.trim();
 
   return {
     listenAddr: envVars.LISTEN_ADDR?.trim() || ":8080",
     proxyApiKey,
-    claudeConfigDir: explicitConfigDir || dirname(credentialsPath),
-    credentialsJSON: envVars.CLAUDE_CREDENTIALS_JSON?.trim() || undefined,
-    credentialsPath,
+    claudeConfigDir: explicitConfigDir || join(homedir(), ".claude"),
+    claudeConfigDirExplicit: Boolean(explicitConfigDir),
     cwd: envVars.CLAUDE_CWD?.trim() || process.cwd(),
     logLevel,
     maxConcurrency: intEnv("MAX_CONCURRENCY", 4, 1, 64),
