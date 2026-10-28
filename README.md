@@ -179,6 +179,18 @@ All configuration is environment-based.
 - The CLI attaches its own environment/account context (working directory, plan tokens, email) to the prompt. `CLAUDE_CWD` controls the directory it sees.
 - One Claude Code process is started per request. The first token latency includes process startup; memory use is roughly a few hundred MB per concurrent request.
 
+## Secret scanning
+
+CI runs [gitleaks](https://github.com/gitleaks/gitleaks) on pushes, pull requests, weekly, and on demand. The rule set and the two historical allowlists are in `.gitleaks.toml`.
+
+To scan locally (requires the `gitleaks` CLI):
+
+```bash
+npm run secrets
+# or
+gitleaks detect --source . --config .gitleaks.toml --redact --verbose
+```
+
 ## Local development
 
 ```bash
