@@ -181,7 +181,7 @@ All configuration is environment-based.
 
 ## Secret scanning
 
-CI runs [gitleaks](https://github.com/gitleaks/gitleaks) on pushes, pull requests, weekly, and on demand. The rule set and the two historical allowlists are in `.gitleaks.toml`.
+CI runs [gitleaks](https://github.com/gitleaks/gitleaks) on pushes, pull requests, and on demand. The rule set and the two historical allowlists are in `.gitleaks.toml`.
 
 To scan locally (requires the `gitleaks` CLI):
 
