@@ -2,7 +2,7 @@
 
 An **Anthropic Messages API-compatible HTTP server** backed by a **Claude subscription** (Pro/Max), using Anthropic's official [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk).
 
-Version 2 is a TypeScript rewrite. It no longer reverse-engineers Claude Code's HTTP requests or fakes its headers. Instead it runs the official Claude Code CLI through the Agent SDK; the CLI owns authentication, OAuth refresh, and the conversation with Anthropic.
+A TypeScript server built on the official [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk). It runs the official Claude Code CLI; the CLI owns authentication, OAuth refresh, and the conversation with Anthropic.
 
 ```
 your agent / SDK
@@ -168,17 +168,9 @@ All configuration is environment-based.
 | `STATE_PATH` | `<claude config dir>/sub-to-api-sessions.json` | Persisted conversation → Claude session bindings. |
 | `CLAUDE_CODE_MAX_RETRIES` | `0` | CLI API retries. Keep `0` so one API request maps to one model response; clients own retries. |
 
-## Migrating from v1
+## Limitations
 
-- Keep `PROXY_API_KEY`, `CREDENTIALS_PATH` and `CLAUDE_CREDENTIALS_JSON`; they mean the same thing.
-- `UPSTREAM_BASE_URL`, `CLAUDE_UA`, `REFRESH_LEEWAY`, and `AUTO_KEEPALIVE` are gone. The SDK talks to Anthropic itself and the CLI refreshes the token.
-- The `/v1/keepalive` endpoints are gone. They existed only to keep the reverse-engineered OAuth token chain warm.
-- The container now needs a writable Claude config directory, not just a readable credentials file, because the CLI writes refreshed tokens there.
-- Model IDs are whatever your account's CLI reports. `GET /v1/models` is authoritative.
-
-## Differences from v1 / limitations
-
-- No OAuth token endpoint calls, keepalive endpoints, or header/identity spoofing. The CLI owns authentication and refresh, so keepalive is unnecessary.
+- Authentication and token refresh are owned by the Claude Code CLI.
 - Session resume is best-effort: a missing session file, a changed model/system prompt, edited history, or a tool-result turn falls back to replaying the transcript. Cache reads still depend on the CLI's own cache-breakpoint placement.
 - Sampling parameters (`temperature`, `top_p`, `top_k`) and `stop_sequences` are not exposed by the Agent SDK and are ignored. `max_tokens` sets the CLI's output ceiling; models that reason even with thinking disabled can spend part of that ceiling before answering, so the proxy gives short requests a 1024-token floor.
 - Thinking blocks are returned only when the request asks for thinking. Some models reason internally even when it is off; those blocks are dropped.
