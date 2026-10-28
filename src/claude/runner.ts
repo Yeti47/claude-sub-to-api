@@ -3,7 +3,7 @@ import { query as sdkQuery, type SDKMessage, type SDKUserMessage } from "@anthro
 import type { Config } from "../config.js";
 import { errorMessage, type Logger } from "../logger.js";
 import type { MessagesRequest, MessagesResponse } from "../anthropic/types.js";
-import { prepareTurn } from "../anthropic/translate.js";
+import { effectiveSystemPrompt, prepareTurn } from "../anthropic/translate.js";
 import { buildToolBridge } from "../anthropic/tools.js";
 import { MessageAssembler } from "./assembler.js";
 import { Semaphore } from "./semaphore.js";
@@ -22,12 +22,37 @@ export class ClientAbort extends Error {
   }
 }
 
+class ResumeFailed extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ResumeFailed";
+  }
+}
+
+function isMissingSession(error: unknown): boolean {
+  const message = errorMessage(error);
+  return /no conversation found|session.*(not found|does not exist)|could not find.*session/i.test(
+    message,
+  );
+}
+
 export interface RunInput {
   request: MessagesRequest;
   signal: AbortSignal;
   requestId: string;
   stream: boolean;
   onEvent?: (event: Record<string, unknown>) => void;
+  /** Resume this Claude session instead of replaying the transcript. */
+  resumeSessionId?: string;
+  /** Index in request.messages where the resumed session's new turns start. */
+  resumeFromIndex?: number;
+  /** Persist the CLI transcript so a later request can resume it. */
+  persistSession?: boolean;
+}
+
+export interface RunResult {
+  response: MessagesResponse;
+  sessionId?: string;
 }
 
 interface QueryHandle extends AsyncIterable<SDKMessage> {
@@ -103,7 +128,7 @@ export class ClaudeRunner {
     return env;
   }
 
-  async run(input: RunInput): Promise<MessagesResponse> {
+  async run(input: RunInput): Promise<RunResult> {
     let release: (() => void) | undefined;
     try {
       release = await this.limit.acquire(input.signal);
@@ -111,22 +136,48 @@ export class ClaudeRunner {
       throw new ClientAbort();
     }
     try {
-      return await this.runInner(input);
+      try {
+        return await this.runInner(input);
+      } catch (error) {
+        if (error instanceof ResumeFailed) {
+          this.logger.warn("Claude session could not be resumed; replaying history", {
+            requestId: input.requestId,
+            sessionId: input.resumeSessionId,
+          });
+          return await this.runInner({
+            ...input,
+            resumeSessionId: undefined,
+            resumeFromIndex: undefined,
+          });
+        }
+        throw error;
+      }
     } finally {
       release();
     }
   }
 
-  private async runInner(input: RunInput): Promise<MessagesResponse> {
+  private async runInner(input: RunInput): Promise<RunResult> {
     const { request, signal, requestId, stream, onEvent } = input;
-    const prepared = prepareTurn(request);
+    const prepared = prepareTurn(request, {
+      resumeFromIndex: input.resumeFromIndex,
+    });
     const bridge = buildToolBridge(prepared.tools);
     const maxTokens = Math.min(
       Math.max(1, request.max_tokens ?? this.config.defaultMaxTokens),
       64_000,
     );
+    // Some models reason even when thinking is off; that reasoning spends
+    // the CLI's output budget. Give short requests headroom so the answer is
+    // not cut off before it starts.
+    const cliMaxTokens =
+      request.thinking?.type === "enabled" || request.thinking?.type === "adaptive"
+        ? maxTokens
+        : Math.max(maxTokens, 1024);
 
-    const system = [prepared.system, prepared.toolChoiceNote].filter(Boolean).join("\n\n");
+    const system = [effectiveSystemPrompt(request.system), prepared.toolChoiceNote]
+      .filter(Boolean)
+      .join("\n\n");
     const controller = new AbortController();
     const onAbort = () => {
       this.logger.debug("client aborted turn", { requestId });
@@ -136,11 +187,11 @@ export class ClaudeRunner {
 
     const options: Record<string, unknown> = {
       cwd: this.config.cwd,
-      env: this.childEnv(maxTokens),
+      env: this.childEnv(cliMaxTokens),
       model: request.model,
       includePartialMessages: true,
       maxTurns: 1,
-      persistSession: false,
+      persistSession: input.persistSession !== false,
       settingSources: [],
       strictMcpConfig: true,
       skills: [],
@@ -167,6 +218,9 @@ export class ClaudeRunner {
     }
     if (this.config.pathToClaudeCodeExecutable) {
       options.pathToClaudeCodeExecutable = this.config.pathToClaudeCodeExecutable;
+    }
+    if (input.resumeSessionId && input.resumeFromIndex !== undefined) {
+      options.resume = input.resumeSessionId;
     }
     // The CLI hides reasoning by default; when the client asked for thinking,
     // ask for summaries so the thinking blocks are not empty.
@@ -207,6 +261,10 @@ export class ClaudeRunner {
       }
     } catch (error) {
       if (signal.aborted) throw new ClientAbort();
+      if (input.resumeSessionId && !assembler.sawStreamEvents) {
+        const reason = assembler.resultError?.message ?? errorMessage(error);
+        if (isMissingSession(reason)) throw new ResumeFailed(reason);
+      }
       if (assembler.resultError) throw errorFor(assembler.resultError);
       if (!internalStop) {
         this.logger.error("claude turn failed", { requestId, error: errorMessage(error) });
@@ -233,10 +291,10 @@ export class ClaudeRunner {
     if (assembler.content.length === 0) {
       // A max_tokens or refusal stop can legitimately have no content.
       if (assembler.stopReason === "max_tokens" || assembler.stopReason === "refusal") {
-        return assembler.response();
+        return { response: assembler.response(), sessionId: assembler.sessionId };
       }
       throw new ApiError(502, "api_error", "Claude Code returned an empty response");
     }
-    return assembler.response();
+    return { response: assembler.response(), sessionId: assembler.sessionId };
   }
 }

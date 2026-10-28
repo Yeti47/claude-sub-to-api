@@ -5,11 +5,15 @@ import type { Logger } from "../logger.js";
 import { isAuthorized } from "../auth/api-key.js";
 import type { PreparedAuth } from "../auth/claude-auth.js";
 import type { MessagesRequest } from "../anthropic/types.js";
+import { effectiveSystemPrompt } from "../anthropic/translate.js";
 import { ApiError, ClientAbort, ClaudeRunner } from "../claude/runner.js";
 import type { ModelCatalog } from "../claude/models.js";
+import type { SessionStore } from "../session/store.js";
+import { deriveConversationKey, systemHash, userMessageHashes } from "../session/hashes.js";
 import { SseWriter } from "./sse.js";
 
 const MAX_BODY = 32 << 20;
+const SESSION_HEADERS = ["x-session-id", "x-bf-session-id", "x-claude-session-id"];
 
 interface Deps {
   config: Config;
@@ -17,6 +21,15 @@ interface Deps {
   runner: ClaudeRunner;
   models: ModelCatalog;
   auth: PreparedAuth;
+  sessions: SessionStore;
+}
+
+function sessionHeader(req: IncomingMessage): string | undefined {
+  for (const name of SESSION_HEADERS) {
+    const value = req.headers[name];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return undefined;
 }
 
 export function createHandler(deps: Deps) {
@@ -94,14 +107,51 @@ export function createHandler(deps: Deps) {
     let writer: SseWriter | undefined;
     if (stream) writer = new SseWriter(res);
 
+    const key = deriveConversationKey(
+      request.messages,
+      sessionHeader(req),
+      request.metadata?.user_id,
+    );
+    const hashes = userMessageHashes(request.messages);
+    const promptHash = systemHash(effectiveSystemPrompt(request.system));
+    const plan = deps.sessions.plan({
+      key,
+      messages: request.messages,
+      model: request.model,
+      cwd: config.cwd,
+      systemHash: promptHash,
+      now: Date.now(),
+    });
+    if (plan) {
+      logger.debug("resuming Claude session", {
+        requestId,
+        sessionId: plan.sessionId,
+        matchedUsers: plan.matchedUsers,
+      });
+    }
+
     try {
-      const response = await deps.runner.run({
+      const result = await deps.runner.run({
         request,
         signal: controller.signal,
         requestId,
         stream,
         onEvent: writer ? (event) => writer!.event(event) : undefined,
+        resumeSessionId: plan?.sessionId,
+        resumeFromIndex: plan?.fromIndex,
+        persistSession: true,
       });
+      const response = result.response;
+      if (result.sessionId) {
+        deps.sessions.record({
+          key,
+          sessionId: result.sessionId,
+          model: request.model,
+          cwd: config.cwd,
+          systemHash: promptHash,
+          userHashes: hashes,
+        });
+      }
       if (writer) {
         writer.finish();
       } else {
@@ -113,9 +163,13 @@ export function createHandler(deps: Deps) {
         model: request.model,
         stream,
         status: 200,
+        resumed: Boolean(plan),
+        sessionId: result.sessionId,
         ms: Date.now() - started,
         input_tokens: response.usage.input_tokens,
         output_tokens: response.usage.output_tokens,
+        cache_read_input_tokens: response.usage.cache_read_input_tokens,
+        cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
       });
     } catch (error) {
       if (error instanceof ClientAbort) {

@@ -30,6 +30,8 @@ export interface Config {
   defaultMaxTokens: number;
   /** Optional explicit path to the Claude Code executable. */
   pathToClaudeCodeExecutable?: string;
+  /** Optional path for persisted conversation -> Claude session bindings. */
+  statePath?: string;
 }
 
 const LEVELS: LogLevel[] = ["debug", "info", "warn", "error"];
@@ -73,5 +75,6 @@ export function loadConfig(envVars: NodeJS.ProcessEnv = process.env): Config {
     requestTimeoutMs: intEnv("REQUEST_TIMEOUT_MS", 15 * 60_000, 10_000, 3_600_000),
     defaultMaxTokens: intEnv("DEFAULT_MAX_TOKENS", 8192, 1, 64_000),
     pathToClaudeCodeExecutable: envVars.CLAUDE_CODE_EXECUTABLE?.trim() || undefined,
+    statePath: envVars.STATE_PATH?.trim() || undefined,
   };
 }

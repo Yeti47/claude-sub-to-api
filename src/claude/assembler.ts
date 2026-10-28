@@ -47,6 +47,7 @@ export class MessageAssembler {
   sawToolUse = false;
   sawMessageStop = false;
   sawStreamEvents = false;
+  sessionId?: string;
   resultError: { type: string; message: string } | null = null;
   /** A CLI-level notice (not model output) that must fail the request. */
   fatalError = false;
@@ -70,6 +71,7 @@ export class MessageAssembler {
 
   handle(message: unknown): void {
     const msg = message as Record<string, unknown>;
+    if (typeof msg.session_id === "string") this.sessionId = msg.session_id;
     switch (msg.type) {
       case "stream_event":
         this.handleStreamEvent(msg.event as Record<string, unknown>);

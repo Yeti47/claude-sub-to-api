@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { prepareTurn, systemText, conversationKey } from "../src/anthropic/translate.js";
+import { prepareTurn, systemText } from "../src/anthropic/translate.js";
 
 function promptContent(request: Parameters<typeof prepareTurn>[0]): unknown[] {
   return (prepareTurn(request).prompt.message.content as unknown[]) ?? [];
@@ -93,12 +93,39 @@ test("systemText tolerates strings and ignores non-text blocks", () => {
   );
 });
 
-test("conversationKey prefers header then metadata session", () => {
-  const request = {
-    model: "m",
-    messages: [{ role: "user" as const, content: "hi" }],
-    metadata: { user_id: JSON.stringify({ session_id: "s1" }) },
-  };
-  assert.equal(conversationKey(request, "h1"), "header:h1");
-  assert.equal(conversationKey(request), "session:s1");
+test("resume mode sends only the new turn when it is a single user message", () => {
+  const prepared = prepareTurn(
+    {
+      model: "claude-sonnet-5-5",
+      messages: [
+        { role: "user", content: "old" },
+        { role: "assistant", content: "old reply" },
+        { role: "user", content: "new" },
+      ],
+    },
+    { resumeFromIndex: 2 },
+  );
+  assert.deepEqual(prepared.prompt.message.content, [{ type: "text", text: "new" }]);
+});
+
+test("resume mode wraps several missed turns", () => {
+  const prepared = prepareTurn(
+    {
+      model: "claude-sonnet-5-5",
+      messages: [
+        { role: "user", content: "old" },
+        { role: "assistant", content: "old reply" },
+        { role: "user", content: "missed" },
+        { role: "assistant", content: "missed reply" },
+        { role: "user", content: "new" },
+      ],
+    },
+    { resumeFromIndex: 2 },
+  );
+  const content = prepared.prompt.message.content as Array<{ text?: string }>;
+  const text = content.map((block) => block.text ?? "").join("\n");
+  assert.match(text, /<messages_since_your_last_turn>/);
+  assert.match(text, /missed reply/);
+  assert.match(text, /<current_message>|new/);
+  assert.ok(!text.includes("<conversation_history>"));
 });

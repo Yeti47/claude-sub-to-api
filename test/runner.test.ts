@@ -45,7 +45,7 @@ test("runs a text turn and configures a constrained SDK session", async () => {
     createLogger("error"),
     fakeQuery(textEvents, (value) => (options = value)) as never,
   );
-  const result = await runner.run({
+  const { response: result } = await runner.run({
     request: {
       model: "claude-sonnet-5-5",
       max_tokens: 16,
@@ -63,9 +63,9 @@ test("runs a text turn and configures a constrained SDK session", async () => {
   assert.deepEqual(options?.tools, []);
   assert.equal(options?.permissionMode, "dontAsk");
   assert.equal(options?.maxTurns, 1);
-  assert.equal(options?.persistSession, false);
+  assert.equal(options?.persistSession, true);
   assert.deepEqual(options?.settingSources, []);
-  assert.equal((options?.env as Record<string, string>).CLAUDE_CODE_MAX_OUTPUT_TOKENS, "16");
+  assert.equal((options?.env as Record<string, string>).CLAUDE_CODE_MAX_OUTPUT_TOKENS, "1024");
   assert.equal((options?.env as Record<string, string>).CLAUDE_CONFIG_DIR, "/tmp/claude-test");
 });
 
@@ -90,7 +90,7 @@ test("stops after a tool_use turn and maps the tool name", async () => {
     ]) as never,
   );
   const streamed: string[] = [];
-  const result = await runner.run({
+  const { response: result } = await runner.run({
     request: {
       model: "claude-sonnet-5-5",
       messages: [{ role: "user", content: "find x" }],

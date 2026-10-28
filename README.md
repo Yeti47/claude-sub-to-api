@@ -19,7 +19,7 @@ Anthropic
 
 ## How it works
 
-- `POST /v1/messages` turns the Messages API request into one Agent SDK turn. The client's system prompt replaces Claude Code's prompt, built-in tools are disabled, project settings/skills/MCP servers are not loaded, and the session is not persisted.
+- `POST /v1/messages` turns the Messages API request into one Agent SDK turn. The client's system prompt replaces Claude Code's prompt, built-in tools are disabled, project settings/skills/MCP servers are not loaded, and each conversation is bound to a persisted Claude session when possible.
 - Conversation history is replayed as a transcript on every request (the server is stateless). The final user turn, including images and documents, is passed through natively.
 - Client-defined `tools` are exposed to Claude as an in-process MCP server. When Claude calls one, the server returns a normal `tool_use` block and stops the turn. The client executes the tool and sends a follow-up request containing `tool_result`.
 - `GET /v1/models` asks the signed-in CLI which models the account can use.
@@ -111,6 +111,23 @@ Tool names are translated to MCP-safe names internally and mapped back in respon
 
 `tool_choice` is supported as follows: `none` hides tools, `auto` is the normal behavior, and `any` / `tool` add a strong instruction but cannot force the underlying CLI's tool-selection mode.
 
+## Session resume and prompt caching
+
+Every request carries a conversation key: the `x-session-id`, `x-bf-session-id` or `x-claude-session-id` header, the `metadata.user_id.session_id` field, or finally a hash of the first user message. The server persists a binding from that key to the Claude Code session id in `STATE_PATH` (default `<claude config dir>/sub-to-api-sessions.json`).
+
+When the next request's user turns extend the bound history, the proxy resumes the same Claude session and sends only the new turn instead of replaying a reconstructed transcript. A changed model, system prompt, shortened/edited history, retry with no new user turn, or a tool-result turn starts a fresh session and falls back to the transcript path.
+
+This is the same mechanism [opencode-claude](https://github.com/openchamber/opencode-claude) uses. It keeps Claude Code's native transcript and lets the CLI reuse its prompt cache. The CLI still injects its own environment/account context and decides where to place cache breakpoints, so cache hits are not guaranteed: in short local tests the CLI reported cache writes (`cache_creation_input_tokens`) but no reads (`cache_read_input_tokens`) even for a resumed turn. Treat resume as avoiding re-serialized history, not as a promise of zero-cost context.
+
+Prompt caching improves when:
+
+- the client sends a stable session header (much better than the first-message hash);
+- the system prompt and model stay the same for the conversation;
+- the client appends to history instead of rewriting it;
+- the conversation is not idle long enough for the cache to expire.
+
+Tool-result turns currently start a fresh session because the tool call is ended before the client returns the result. A future step is to park the tool call and resume the same live turn, which is what opencode-claude's bridge does.
+
 ## Configuration
 
 All configuration is environment-based.
@@ -129,6 +146,7 @@ All configuration is environment-based.
 | `DEFAULT_MAX_TOKENS` | `8192` | Output ceiling when `max_tokens` is omitted (the Messages API requires it). |
 | `CLAUDE_CWD` | process cwd | Working directory for the CLI. No project settings are loaded. |
 | `CLAUDE_CODE_EXECUTABLE` | SDK default | Path to a specific Claude Code executable. |
+| `STATE_PATH` | `<claude config dir>/sub-to-api-sessions.json` | Persisted conversation → Claude session bindings. |
 | `CLAUDE_CODE_MAX_RETRIES` | `0` | CLI API retries. Keep `0` so one API request maps to one model response; clients own retries. |
 
 ## Migrating from v1
@@ -142,11 +160,12 @@ All configuration is environment-based.
 ## Differences from v1 / limitations
 
 - No OAuth token endpoint calls, keepalive endpoints, or header/identity spoofing. The CLI owns authentication and refresh, so keepalive is unnecessary.
-- No cross-request Claude session resume: each request is stateless and replays history. This is simple and correct, but does not keep Anthropic's prompt cache warm between requests.
-- Sampling parameters (`temperature`, `top_p`, `top_k`) and `stop_sequences` are not exposed by the Agent SDK and are ignored. `max_tokens` sets the CLI's output ceiling.
+- Session resume is best-effort: a missing session file, a changed model/system prompt, edited history, or a tool-result turn falls back to replaying the transcript. Cache reads still depend on the CLI's own cache-breakpoint placement.
+- Sampling parameters (`temperature`, `top_p`, `top_k`) and `stop_sequences` are not exposed by the Agent SDK and are ignored. `max_tokens` sets the CLI's output ceiling; models that reason even with thinking disabled can spend part of that ceiling before answering, so the proxy gives short requests a 1024-token floor.
 - Thinking blocks are returned only when the request asks for thinking. Some models reason internally even when it is off; those blocks are dropped.
 - Images and documents are passed through as native content blocks. An unprocessable attachment becomes a `400 invalid_request_error`.
-- `metadata` is accepted but not forwarded.
+- `metadata` is used only to derive a conversation key; it is not forwarded.
+- The CLI attaches its own environment/account context (working directory, plan tokens, email) to the prompt. `CLAUDE_CWD` controls the directory it sees.
 - One Claude Code process is started per request. The first token latency includes process startup; memory use is roughly a few hundred MB per concurrent request.
 
 ## Local development

@@ -6,6 +6,8 @@ import { prepareClaudeAuth } from "./auth/claude-auth.js";
 import { ClaudeRunner } from "./claude/runner.js";
 import { ModelCatalog } from "./claude/models.js";
 import { createHandler } from "./http/server.js";
+import { SessionStore } from "./session/store.js";
+import { join } from "node:path";
 
 function listenOptions(addr: string): { host?: string; port: number } {
   if (addr.startsWith(":")) return { port: Number(addr.slice(1)) };
@@ -22,7 +24,11 @@ async function main(): Promise<void> {
   const auth = await prepareClaudeAuth(config, logger);
   const runner = new ClaudeRunner(config, logger);
   const models = new ModelCatalog(config, logger);
-  const handler = createHandler({ config, logger, runner, models, auth });
+  const statePath =
+    config.statePath ??
+    (config.claudeConfigDir ? join(config.claudeConfigDir, "sub-to-api-sessions.json") : undefined);
+  const sessions = new SessionStore(statePath, logger);
+  const handler = createHandler({ config, logger, runner, models, auth, sessions });
 
   const server = createServer((req, res) => {
     handler(req, res).catch((error: unknown) => {

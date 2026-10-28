@@ -14,7 +14,6 @@ import type {
   DocumentBlock,
   Message,
   MessagesRequest,
-  TextBlock,
   ToolDefinition,
   ToolResultBlock,
   ToolUseBlock,
@@ -34,6 +33,13 @@ export function contentBlocks(content: string | ContentBlock[]): ContentBlock[] 
     return content ? [{ type: "text", text: content }] : [];
   }
   return Array.isArray(content) ? content : [];
+}
+
+export const DEFAULT_SYSTEM_PROMPT =
+  "You are Claude, a helpful AI assistant. Respond directly to the user.";
+
+export function effectiveSystemPrompt(system: unknown): string {
+  return systemText(system) ?? DEFAULT_SYSTEM_PROMPT;
 }
 
 export function systemText(system: unknown): string | undefined {
@@ -142,13 +148,41 @@ function hasRichContent(message: Message): boolean {
   );
 }
 
+function buildResumeBlocks(segment: Message[]): SdkBlock[] {
+  const blocks: SdkBlock[] = [
+    { type: "text", text: "<messages_since_your_last_turn>" },
+  ];
+  for (const message of segment) {
+    blocks.push({ type: "text", text: `<${message.role}>` });
+    blocks.push(...messageToBlocks(message));
+    blocks.push({ type: "text", text: `</${message.role}>` });
+  }
+  blocks.push({ type: "text", text: "</messages_since_your_last_turn>" });
+  blocks.push({
+    type: "text",
+    text:
+      segment.at(-1)?.role === "assistant"
+        ? "Continue the assistant message above. Reply with the assistant's continuation only."
+        : "Continue the conversation from your session. Reply to the latest user message only.",
+  });
+  return blocks;
+}
+
+export interface PrepareTurnOptions {
+  /** With a resumed Claude session, the index where its new turns start. */
+  resumeFromIndex?: number;
+}
+
 /**
  * A single-turn text request is passed through untouched, which is both the
  * common case and the shortest possible prompt. Anything with history is
  * wrapped in explicit transcript markers so Claude answers the final turn
  * rather than continuing the transcript.
  */
-export function prepareTurn(request: MessagesRequest): PreparedTurn {
+export function prepareTurn(
+  request: MessagesRequest,
+  options: PrepareTurnOptions = {},
+): PreparedTurn {
   const messages = Array.isArray(request.messages) ? request.messages : [];
   const allTools = request.tools ?? [];
   const choice = request.tool_choice;
@@ -157,9 +191,23 @@ export function prepareTurn(request: MessagesRequest): PreparedTurn {
   else if (choice?.type === "tool") tools = allTools.filter((tool) => tool.name === choice.name);
 
   const system = systemText(request.system);
-  let direct = messages.length === 1 && messages[0]?.role === "user" && !hasRichContent(messages[0]!)
-    ? messageToBlocks(messages[0]!)
-    : null;
+  let direct: SdkBlock[] | null = null;
+
+  if (options.resumeFromIndex !== undefined && options.resumeFromIndex >= 0) {
+    const segment = messages.slice(options.resumeFromIndex);
+    if (segment.length === 1 && segment[0]?.role === "user" && !hasRichContent(segment[0]!)) {
+      direct = messageToBlocks(segment[0]!);
+    } else if (segment.length > 0) {
+      direct = buildResumeBlocks(segment);
+    }
+  }
+
+  if (!direct) {
+    direct =
+      messages.length === 1 && messages[0]?.role === "user" && !hasRichContent(messages[0]!)
+        ? messageToBlocks(messages[0]!)
+        : null;
+  }
 
   if (!direct) {
     const blocks: SdkBlock[] = [];
@@ -219,36 +267,4 @@ function toolChoiceNote(request: MessagesRequest): string | undefined {
     return "You must call the only available tool in this turn.";
   }
   return undefined;
-}
-
-/** First text block of the last user message, used for logging and keys. */
-export function lastUserText(request: MessagesRequest): string {
-  const last = [...(request.messages ?? [])].reverse().find((m) => m.role === "user");
-  if (!last) return "";
-  return contentBlocks(last.content)
-    .filter((block): block is TextBlock => block.type === "text")
-    .map((block) => block.text)
-    .join("\n");
-}
-
-/** Stable conversation key: explicit metadata session, else a history digest. */
-export function conversationKey(request: MessagesRequest, headerSession?: string): string {
-  if (headerSession) return `header:${headerSession}`;
-  const metadata = request.metadata?.user_id;
-  if (metadata) {
-    try {
-      const parsed = JSON.parse(metadata) as { session_id?: unknown };
-      if (typeof parsed.session_id === "string" && parsed.session_id) {
-        return `session:${parsed.session_id}`;
-      }
-    } catch {
-      return `user:${metadata}`;
-    }
-  }
-  const first = contentBlocks(request.messages?.[0]?.content ?? "")
-    .filter((block): block is TextBlock => block.type === "text")
-    .map((block) => block.text)
-    .join("")
-    .slice(0, 200);
-  return `history:${first.length}:${first}`;
 }
