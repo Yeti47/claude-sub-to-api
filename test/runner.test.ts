@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ClaudeRunner, ApiError } from "../src/claude/runner.js";
+import { PendingToolRegistry } from "../src/claude/pending-tools.js";
 import { createLogger } from "../src/logger.js";
 import type { Config } from "../src/config.js";
 
@@ -14,6 +15,7 @@ const config: Config = {
   maxConcurrency: 1,
   requestTimeoutMs: 60_000,
   defaultMaxTokens: 100,
+  parkedTurnTtlMs: 0,
 };
 
 function fakeQuery(messages: unknown[], capture?: (options: Record<string, unknown>) => void) {
@@ -79,28 +81,62 @@ test("runs a text turn and configures a constrained SDK session", async () => {
   assert.equal((options?.env as Record<string, string>).CLAUDE_CONFIG_DIR, "/tmp/claude-test");
 });
 
-test("stops after a tool_use turn and maps the tool name", async () => {
+test("parks a tool_use turn and resumes it with the client result", async () => {
+  let pending: PendingToolRegistry | undefined;
+  const toolEvents = [
+    { type: "stream_event", event: { type: "message_start", message: { id: "msg_10", usage: { input_tokens: 4 } } } },
+    {
+      type: "stream_event",
+      event: {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "t1", name: "mcp__claude_sub_to_api__lookup" },
+      },
+    },
+    { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"q":"x"}' } } },
+    { type: "stream_event", event: { type: "content_block_stop", index: 0 } },
+    { type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 2 } } },
+    { type: "stream_event", event: { type: "message_stop" } },
+  ];
+  const continuation = [
+    { type: "stream_event", event: { type: "message_start", message: { id: "msg_11", usage: { input_tokens: 6 } } } },
+    { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } },
+    { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "done" } } },
+    { type: "stream_event", event: { type: "content_block_stop", index: 0 } },
+    { type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } } },
+    { type: "stream_event", event: { type: "message_stop" } },
+    { type: "result", subtype: "success", is_error: false, result: "done", stop_reason: "end_turn", usage: { input_tokens: 6, output_tokens: 1 } },
+  ];
+
+  const queryFn = () => ({
+    async *[Symbol.asyncIterator]() {
+      let call: Promise<unknown> | undefined;
+      for (const event of toolEvents) {
+        if (
+          event.type === "stream_event" &&
+          (event.event as { type?: string }).type === "message_stop"
+        ) {
+          // Simulate the CLI invoking the MCP handler after message_stop.
+          setTimeout(() => {
+            call = pending!.register("lookup", { q: "x" });
+          }, 0);
+        }
+        yield event;
+      }
+      await call;
+      for (const event of continuation) yield event;
+    },
+    close() {},
+  });
+
   const runner = new ClaudeRunner(
     config,
     createLogger("error"),
-    fakeQuery([
-      { type: "stream_event", event: { type: "message_start", message: { id: "msg_10", usage: { input_tokens: 4 } } } },
-      {
-        type: "stream_event",
-        event: {
-          type: "content_block_start",
-          index: 0,
-          content_block: { type: "tool_use", id: "t1", name: "mcp__claude_sub_to_api__lookup" },
-        },
-      },
-      { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"q":"x"}' } } },
-      { type: "stream_event", event: { type: "content_block_stop", index: 0 } },
-      { type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 2 } } },
-      { type: "stream_event", event: { type: "message_stop" } },
-    ]) as never,
+    queryFn as never,
+    () => (pending = new PendingToolRegistry()),
   );
   const streamed: string[] = [];
-  const { response: result } = await runner.run({
+  const first = await runner.run({
     request: {
       model: "claude-sonnet-5-5",
       messages: [{ role: "user", content: "find x" }],
@@ -112,14 +148,31 @@ test("stops after a tool_use turn and maps the tool name", async () => {
     onEvent: (event) => streamed.push(String(event.type)),
   });
 
-  assert.equal(result.stop_reason, "tool_use");
-  assert.deepEqual(result.content[0], {
+  assert.ok(first.parked);
+  assert.equal(first.response.stop_reason, "tool_use");
+  assert.deepEqual(first.response.content[0], {
     type: "tool_use",
     id: "t1",
     name: "lookup",
     input: { q: "x" },
   });
   assert.ok(streamed.includes("content_block_start"));
+
+  const second = await first.parked!.resume({
+    request: {
+      model: "claude-sonnet-5-5",
+      messages: [{ role: "user", content: "find x" }],
+    },
+    signal: new AbortController().signal,
+    requestId: "r3",
+    stream: false,
+    toolResults: new Map([
+      ["t1", { type: "tool_result", tool_use_id: "t1", content: "42" }],
+    ]),
+    steeringText: "",
+  });
+  assert.equal(second.parked, undefined);
+  assert.deepEqual(second.response.content[0], { type: "text", text: "done" });
 });
 
 test("turns an SDK rate-limit result into a 429", async () => {

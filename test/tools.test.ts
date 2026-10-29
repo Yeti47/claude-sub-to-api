@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildToolBridge, sanitizeToolNames, MCP_SERVER_NAME, MCP_TOOL_PREFIX } from "../src/anthropic/tools.js";
+import { PendingToolRegistry } from "../src/claude/pending-tools.js";
 
 test("sanitizes invalid tool names without collisions", () => {
   const names = sanitizeToolNames([
@@ -24,7 +25,7 @@ test("builds an in-process MCP server and a reverse name map", () => {
         required: ["query"],
       },
     },
-  ]);
+  ], new PendingToolRegistry());
   assert.ok(bridge);
   assert.deepEqual(bridge?.exposedNames, [`${MCP_TOOL_PREFIX}lookup`]);
   assert.equal(bridge?.toClientName.get(`${MCP_TOOL_PREFIX}lookup`), "lookup");
@@ -32,5 +33,5 @@ test("builds an in-process MCP server and a reverse name map", () => {
 });
 
 test("empty tool lists produce no MCP server", () => {
-  assert.equal(buildToolBridge([]), undefined);
+  assert.equal(buildToolBridge([], new PendingToolRegistry()), undefined);
 });

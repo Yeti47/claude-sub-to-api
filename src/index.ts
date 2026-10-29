@@ -8,6 +8,7 @@ import { ClaudeRunner } from "./claude/runner.js";
 import { ModelCatalog } from "./claude/models.js";
 import { createHandler } from "./http/server.js";
 import { SessionStore } from "./session/store.js";
+import { ParkedTurnStore } from "./claude/parked.js";
 import { join } from "node:path";
 
 function listenOptions(addr: string): { host?: string; port: number } {
@@ -38,7 +39,8 @@ async function main(): Promise<void> {
     config.statePath ??
     (config.claudeConfigDir ? join(config.claudeConfigDir, "sub-to-api-sessions.json") : undefined);
   const sessions = new SessionStore(statePath, logger);
-  const handler = createHandler({ config, logger, runner, models, auth, sessions });
+  const parked = new ParkedTurnStore(logger, config.parkedTurnTtlMs);
+  const handler = createHandler({ config, logger, runner, models, auth, sessions, parked });
 
   const server = createServer((req, res) => {
     handler(req, res).catch((error: unknown) => {
@@ -79,6 +81,8 @@ async function main(): Promise<void> {
     force.unref();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     clearTimeout(force);
+    parked.closeAll("Server shutting down");
+    parked.stop();
     await auth.cleanup();
     process.exit(0);
   };

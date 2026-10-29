@@ -13,3 +13,7 @@ paths = [
   '''internal/creds/manager\.go''',
   '''internal/proxy/handler\.go''',
 ]
+
+[[allowlists]]
+description = "Local secret store; .env is gitignored and never committed"
+paths = ['''^\.env$''']

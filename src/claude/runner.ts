@@ -1,12 +1,25 @@
 /** Runs one Messages API turn through the Claude Agent SDK. */
+import { randomUUID } from "node:crypto";
 import { query as sdkQuery, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { Config } from "../config.js";
 import { errorMessage, type Logger } from "../logger.js";
-import type { MessagesRequest, MessagesResponse } from "../anthropic/types.js";
-import { prepareTurn } from "../anthropic/translate.js";
-import { buildToolBridge } from "../anthropic/tools.js";
+import type {
+  MessagesRequest,
+  MessagesResponse,
+  ToolResultBlock,
+  ToolUseBlock,
+} from "../anthropic/types.js";
+import { contentBlocks, prepareTurn } from "../anthropic/translate.js";
+import { buildToolBridge, type ToolBridge } from "../anthropic/tools.js";
 import { MessageAssembler } from "./assembler.js";
 import { Semaphore } from "./semaphore.js";
+import {
+  PendingToolRegistry,
+  type CallToolResult,
+  type McpContent,
+  type PendingToolCall,
+} from "./pending-tools.js";
+import { ParkedTurn, type ResumeParkedInput } from "./parked.js";
 
 export class ApiError extends Error {
   constructor(readonly status: number, readonly type: string, message: string) {
@@ -53,6 +66,21 @@ export interface RunInput {
 export interface RunResult {
   response: MessagesResponse;
   sessionId?: string;
+  /** Set when the turn stopped on a tool call and waits for client results. */
+  parked?: ParkedTurn;
+}
+
+interface TurnState {
+  model: string;
+  bridge?: ToolBridge;
+  pending: PendingToolRegistry;
+  handle: QueryHandle;
+  iterator: AsyncIterator<SDKMessage>;
+  controller: AbortController;
+  includeThinking: boolean;
+  release: () => void;
+  sessionId?: string;
+  closed: boolean;
 }
 
 interface QueryHandle extends AsyncIterable<SDKMessage> {
@@ -133,6 +161,7 @@ export class ClaudeRunner {
     private readonly config: Config,
     private readonly logger: Logger,
     private readonly queryFn: QueryFactory = sdkQuery as unknown as QueryFactory,
+    private readonly createPending: () => PendingToolRegistry = () => new PendingToolRegistry(),
   ) {
     this.limit = new Semaphore(config.maxConcurrency);
   }
@@ -167,34 +196,41 @@ export class ClaudeRunner {
     } catch {
       throw new ClientAbort();
     }
+    let result: RunResult;
     try {
       try {
-        return await this.runInner(input);
+        result = await this.runInner(input, release);
       } catch (error) {
         if (error instanceof ResumeFailed) {
           this.logger.warn("Claude session could not be resumed; replaying history", {
             requestId: input.requestId,
             sessionId: input.resumeSessionId,
           });
-          return await this.runInner({
-            ...input,
-            resumeSessionId: undefined,
-            resumeFromIndex: undefined,
-          });
+          result = await this.runInner(
+            { ...input, resumeSessionId: undefined, resumeFromIndex: undefined },
+            release,
+          );
+        } else {
+          throw error;
         }
-        throw error;
       }
-    } finally {
+    } catch (error) {
       release();
+      throw error;
     }
+    // A parked turn keeps its CLI process and concurrency slot alive until
+    // the client returns tool results or the TTL closes it.
+    if (!result.parked) release();
+    return result;
   }
 
-  private async runInner(input: RunInput): Promise<RunResult> {
+  private async runInner(input: RunInput, release: () => void): Promise<RunResult> {
     const { request, signal, requestId, stream, onEvent } = input;
     const prepared = prepareTurn(request, {
       resumeFromIndex: input.resumeFromIndex,
     });
-    const bridge = buildToolBridge(prepared.tools);
+    const pending = this.createPending();
+    const bridge = buildToolBridge(prepared.tools, pending);
     const maxTokens = Math.min(
       Math.max(1, request.max_tokens ?? this.config.defaultMaxTokens),
       64_000,
@@ -210,18 +246,12 @@ export class ClaudeRunner {
     const system = prepared.system;
     const systemOption = systemPromptOption(system);
     const controller = new AbortController();
-    const onAbort = () => {
-      this.logger.debug("client aborted turn", { requestId });
-      controller.abort();
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
 
     const options: Record<string, unknown> = {
       cwd: this.config.cwd,
       env: this.childEnv(cliMaxTokens),
       model: request.model,
       includePartialMessages: true,
-      maxTurns: 1,
       persistSession: input.persistSession !== false,
       settingSources: [],
       strictMcpConfig: true,
@@ -242,10 +272,12 @@ export class ClaudeRunner {
     }
     if (bridge) {
       options.mcpServers = bridge.mcpServers;
-      // Deliberately do NOT add the MCP tools to allowedTools. `dontAsk`
-      // refuses every tool that is not explicitly allowed, so Claude can
-      // emit a tool_use block but the CLI never executes it. `maxTurns: 1`
-      // then ends the turn; the API client owns execution.
+      // The CLI must be allowed to call the in-process handlers; they block
+      // until the API client returns the tool result.
+      options.allowedTools = bridge.exposedNames;
+    } else {
+      // A text-only turn needs exactly one assistant message.
+      options.maxTurns = 1;
     }
     if (this.config.pathToClaudeCodeExecutable) {
       options.pathToClaudeCodeExecutable = this.config.pathToClaudeCodeExecutable;
@@ -260,21 +292,44 @@ export class ClaudeRunner {
       options.extraArgs = { "thinking-display": "summarized" };
     }
 
-    const assembler = new MessageAssembler(
-      request.model,
-      bridge,
-      stream ? onEvent : undefined,
-      request.thinking?.type === "enabled" || request.thinking?.type === "adaptive",
-    );
     const handle = this.queryFn({ prompt: singlePrompt(prepared.prompt), options });
-    let internalStop = false;
+    const state: TurnState = {
+      model: request.model,
+      bridge,
+      pending,
+      handle,
+      iterator: handle[Symbol.asyncIterator](),
+      controller,
+      includeThinking:
+        request.thinking?.type === "enabled" || request.thinking?.type === "adaptive",
+      release,
+      closed: false,
+    };
+    return this.consume(state, input);
+  }
+
+  private async consume(state: TurnState, input: RunInput): Promise<RunResult> {
+    const assembler = new MessageAssembler(
+      state.model,
+      state.bridge,
+      input.stream ? input.onEvent : undefined,
+      state.includeThinking,
+    );
+    const onAbort = () => {
+      this.logger.debug("client aborted turn", { requestId: input.requestId });
+      state.controller.abort();
+    };
+    input.signal.addEventListener("abort", onAbort, { once: true });
     let lastMessage: Record<string, unknown> | undefined;
 
     try {
-      for await (const message of handle) {
+      while (true) {
+        const next = await state.iterator.next();
+        if (next.done) break;
+        const message = next.value;
         lastMessage = message as Record<string, unknown>;
         this.logger.debug("sdk message", {
-          requestId,
+          requestId: input.requestId,
           type: lastMessage.type,
           subtype: lastMessage.subtype,
           event:
@@ -283,49 +338,165 @@ export class ClaudeRunner {
               : undefined,
         });
         assembler.handle(message);
+        if (assembler.sessionId) state.sessionId = assembler.sessionId;
+
         if (assembler.sawToolUse && assembler.sawMessageStop) {
-          internalStop = true;
-          controller.abort();
-          break;
+          const response = assembler.response();
+          const blocks = response.content.filter(
+            (block): block is ToolUseBlock => block.type === "tool_use",
+          );
+          await state.pending.waitFor(blocks.length, 15_000, input.signal);
+          if (!matchToolCalls(blocks, state.pending.calls(), state.pending)) {
+            throw new ApiError(502, "api_error", "Claude requested a tool the bridge could not match");
+          }
+          return { response, sessionId: state.sessionId, parked: this.makeParked(state) };
         }
         if (lastMessage.type === "result") break;
       }
     } catch (error) {
-      if (signal.aborted) throw new ClientAbort();
+      this.closeState(state, "Turn failed");
+      if (input.signal.aborted) throw new ClientAbort();
+      if (error instanceof ApiError || error instanceof ResumeFailed || error instanceof ClientAbort) {
+        throw error;
+      }
       if (input.resumeSessionId && !assembler.sawStreamEvents) {
         const reason = assembler.resultError?.message ?? errorMessage(error);
         if (isMissingSession(reason)) throw new ResumeFailed(reason);
       }
       if (assembler.resultError) throw errorFor(assembler.resultError);
-      if (!internalStop) {
-        this.logger.error("claude turn failed", { requestId, error: errorMessage(error) });
-        throw new ApiError(502, "api_error", `Claude Code turn failed: ${errorMessage(error)}`);
-      }
+      this.logger.error("claude turn failed", {
+        requestId: input.requestId,
+        error: errorMessage(error),
+      });
+      throw new ApiError(502, "api_error", `Claude Code turn failed: ${errorMessage(error)}`);
     } finally {
-      signal.removeEventListener("abort", onAbort);
-      try {
-        handle.close?.();
-      } catch {
-        // already closed
-      }
+      input.signal.removeEventListener("abort", onAbort);
     }
 
     if (assembler.fatalError && assembler.resultError) {
+      this.closeState(state, "Turn failed");
       throw errorFor(assembler.resultError);
     }
     if (assembler.resultError && assembler.content.length === 0) {
+      this.closeState(state, "Turn failed");
       throw errorFor(assembler.resultError);
     }
     if (assembler.content.length === 0 && typeof lastMessage?.result === "string") {
       assembler.content = [{ type: "text", text: lastMessage.result }];
     }
     if (assembler.content.length === 0) {
-      // A max_tokens or refusal stop can legitimately have no content.
-      if (assembler.stopReason === "max_tokens" || assembler.stopReason === "refusal") {
-        return { response: assembler.response(), sessionId: assembler.sessionId };
+      if (assembler.stopReason !== "max_tokens" && assembler.stopReason !== "refusal") {
+        this.closeState(state, "Empty response");
+        throw new ApiError(502, "api_error", "Claude Code returned an empty response");
       }
-      throw new ApiError(502, "api_error", "Claude Code returned an empty response");
     }
-    return { response: assembler.response(), sessionId: assembler.sessionId };
+    const response = assembler.response();
+    this.closeState(state, "Turn finished");
+    return { response, sessionId: state.sessionId };
   }
+
+  private makeParked(state: TurnState): ParkedTurn {
+    return new ParkedTurn(randomUUID(), state.sessionId, state.pending, {
+      resume: (input) => this.resumeParked(state, input),
+      close: (reason) => {
+        this.closeState(state, reason);
+        state.release();
+      },
+    });
+  }
+
+  private async resumeParked(state: TurnState, input: ResumeParkedInput): Promise<RunResult> {
+    const ids = state.pending.pendingIds();
+    for (const id of ids) {
+      if (!input.toolResults.has(id)) {
+        throw new ApiError(400, "invalid_request_error", `missing tool_result for ${id}`);
+      }
+    }
+    const lastId = ids.at(-1);
+    for (const id of ids) {
+      const block = input.toolResults.get(id)!;
+      state.pending.resolve(id, toMcpResult(block, id === lastId ? input.steeringText : ""));
+    }
+    state.pending.beginPhase();
+    try {
+      const result = await this.consume(state, input);
+      if (!result.parked) state.release();
+      return result;
+    } catch (error) {
+      this.closeState(state, "Tool continuation failed");
+      state.release();
+      throw error;
+    }
+  }
+
+  private closeState(state: TurnState, reason: string): void {
+    if (state.closed) return;
+    state.closed = true;
+    state.pending.rejectAll(new Error(reason));
+    try {
+      state.handle.close?.();
+    } catch {
+      // already closed
+    }
+  }
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
+    .join(",")}}`;
+}
+
+function matchToolCalls(
+  blocks: ToolUseBlock[],
+  calls: PendingToolCall[],
+  pending: PendingToolRegistry,
+): boolean {
+  const remaining = [...calls];
+  for (const block of blocks) {
+    let index = remaining.findIndex(
+      (call) =>
+        call.name === block.name && stableStringify(call.args) === stableStringify(block.input),
+    );
+    if (index < 0) {
+      // The MCP layer may normalise argument types; fall back to name order.
+      index = remaining.findIndex((call) => call.name === block.name);
+    }
+    if (index < 0) return false;
+    const call = remaining.splice(index, 1)[0]!;
+    pending.link(block.id, call);
+  }
+  return true;
+}
+
+function toMcpResult(block: ToolResultBlock, steeringText: string): CallToolResult {
+  const content: McpContent[] = [];
+  for (const part of contentBlocks(block.content ?? "")) {
+    if (part.type === "text") {
+      content.push({ type: "text", text: part.text });
+    } else if (part.type === "image" && part.source.type === "base64") {
+      content.push({
+        type: "image",
+        data: part.source.data,
+        mimeType: part.source.media_type,
+      });
+    } else if (part.type === "document") {
+      content.push({
+        type: "text",
+        text:
+          part.source.type === "url"
+            ? `[document: ${part.source.url}]`
+            : `[document: ${part.title ?? part.media_type ?? "attachment"}]`,
+      });
+    } else {
+      content.push({ type: "text", text: JSON.stringify(part) });
+    }
+  }
+  if (steeringText.trim()) content.push({ type: "text", text: steeringText });
+  if (content.length === 0) content.push({ type: "text", text: "" });
+  return { content, isError: block.is_error === true };
 }

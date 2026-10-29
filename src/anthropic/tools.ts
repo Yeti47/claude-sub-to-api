@@ -2,10 +2,9 @@
  * Expose client-defined Messages API tools to Claude Code as an in-process
  * MCP server.
  *
- * This server never executes a tool. A handler exists only so Claude can emit
- * a complete `tool_use` block; the runner stops the turn as soon as the block
- * is complete and returns it to the API client, which executes the tool and
- * sends a follow-up request with the result.
+ * This server does not execute tools itself. Each handler blocks until the
+ * API client returns a `tool_result`; the runner keeps the CLI turn parked
+ * meanwhile, so the same session and prompt cache continue.
  */
 import {
   createSdkMcpServer,
@@ -14,19 +13,10 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import type { ToolDefinition } from "./types.js";
+import type { PendingToolRegistry } from "../claude/pending-tools.js";
 
 export const MCP_SERVER_NAME = "claude_sub_to_api";
 export const MCP_TOOL_PREFIX = `mcp__${MCP_SERVER_NAME}__`;
-
-export class ToolCallParked extends Error {
-  constructor(
-    readonly toolName: string,
-    readonly args: Record<string, unknown>,
-  ) {
-    super(`Tool call ${toolName} is executed by the API client`);
-    this.name = "ToolCallParked";
-  }
-}
 
 export interface ToolBridge {
   mcpServers: Record<string, McpSdkServerConfigWithInstance>;
@@ -70,7 +60,10 @@ function inputShape(schema: Record<string, unknown> | undefined): unknown {
   }
 }
 
-export function buildToolBridge(tools: ToolDefinition[]): ToolBridge | undefined {
+export function buildToolBridge(
+  tools: ToolDefinition[],
+  pending: PendingToolRegistry,
+): ToolBridge | undefined {
   if (tools.length === 0) return undefined;
 
   const shortNames = sanitizeToolNames(tools);
@@ -89,10 +82,11 @@ export function buildToolBridge(tools: ToolDefinition[]): ToolBridge | undefined
       definition.description || definition.name,
       ((shape as { shape?: Record<string, unknown> }).shape ??
         shape) as any,
-      async (args: any) => {
-        throw new ToolCallParked(definition.name, args ?? {});
-      },
-      { alwaysLoad: true },
+      async (args: any) => (await pending.register(definition.name, args ?? {})) as any,
+      // The proxy never runs these tools, so marking them read-only lets the
+      // CLI invoke parallel tool calls concurrently instead of serialising
+      // them behind the first blocked handler.
+      { alwaysLoad: true, annotations: { readOnlyHint: true } },
     );
   });
 
@@ -102,6 +96,7 @@ export function buildToolBridge(tools: ToolDefinition[]): ToolBridge | undefined
     name: shortNames.get(definition.name) ?? definition.name,
     description: definition.description || definition.name,
     inputSchema: definition.input_schema ?? { type: "object", properties: {} },
+    annotations: { readOnlyHint: true },
     _meta: { "anthropic/alwaysLoad": true },
   }));
 

@@ -30,6 +30,8 @@ export interface Config {
   pathToClaudeCodeExecutable?: string;
   /** Optional path for persisted conversation -> Claude session bindings. */
   statePath?: string;
+  /** How long a turn may wait for client tool results before it is closed. */
+  parkedTurnTtlMs: number;
 }
 
 const LEVELS: LogLevel[] = ["debug", "info", "warn", "error"];
@@ -78,5 +80,6 @@ export function loadConfig(envVars: NodeJS.ProcessEnv = process.env): Config {
     defaultMaxTokens: intEnv("DEFAULT_MAX_TOKENS", 8192, 1, 64_000),
     pathToClaudeCodeExecutable: envVars.CLAUDE_CODE_EXECUTABLE?.trim() || undefined,
     statePath: envVars.STATE_PATH?.trim() || undefined,
+    parkedTurnTtlMs: intEnv("PARKED_TURN_TTL_MS", 30 * 60_000, 0, 24 * 60 * 60_000),
   };
 }

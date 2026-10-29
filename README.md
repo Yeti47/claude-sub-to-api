@@ -130,14 +130,14 @@ One consequence is that the harness prompt is coding-oriented and the CLI attach
 
 Every request carries a conversation key: the `x-session-id`, `x-bf-session-id` or `x-claude-session-id` header, the `metadata.user_id.session_id` field, or finally a hash of the first user message. The server persists a binding from that key to the Claude Code session id in `STATE_PATH` (default `<claude config dir>/sub-to-api-sessions.json`).
 
-When the next request's user turns extend the bound history, the proxy resumes the same Claude session and sends only the new turn instead of replaying a reconstructed transcript. A changed model, system prompt, shortened/edited history, retry with no new user turn, or a tool-result turn starts a fresh session and falls back to the transcript path.
+When the next request's user turns extend the bound history, the proxy resumes the same Claude session and sends only the new turn instead of replaying a reconstructed transcript. A changed model, system prompt, shortened/edited history, or a retry with no new user turn starts a fresh session and falls back to the transcript path. Tool-result turns are handled by the parked-tool bridge below.
 
 This is the same mechanism [opencode-claude](https://github.com/openchamber/opencode-claude) uses. With the stable harness prompt (`excludeDynamicSections: true`) and resume, a live two-turn Haiku test showed real cache reuse:
 
 - turn 1: `cache_read_input_tokens: 658`, `cache_creation_input_tokens: 2490`
 - turn 2, resumed: `cache_read_input_tokens: 2813`, `cache_creation_input_tokens: 489`
 
-An earlier build that replaced the harness prompt with a custom prompt reported no cache reads on resume. Keeping Claude Code's prompt and letting it move dynamic sections into the first message is what made the difference. It is still best-effort: the CLI controls breakpoint placement, and a tool-result turn starts a fresh session today.
+An earlier build that replaced the harness prompt with a custom prompt reported no cache reads on resume. Keeping Claude Code's prompt and letting it move dynamic sections into the first message is what made the difference. It is still best-effort: the CLI controls breakpoint placement. Tool calls park the live turn, so the continuation keeps the same session and cache.
 
 Prompt caching improves when:
 
@@ -146,7 +146,7 @@ Prompt caching improves when:
 - the client appends to history instead of rewriting it;
 - the conversation is not idle long enough for the cache to expire.
 
-Tool-result turns currently start a fresh session because the tool call is ended before the client returns the result. A future step is to park the tool call and resume the same live turn, which is what opencode-claude's bridge does.
+When Claude calls a client tool, the proxy does not end the CLI turn. The MCP handler blocks, the `tool_use` response is sent, and the process stays alive. The follow-up request with `tool_result` resolves the handler and continues the same live turn, so the session and cache stay intact. A turn nobody resumes is closed after `PARKED_TURN_TTL_MS` (30 minutes by default).
 
 ## Configuration
 
@@ -165,12 +165,13 @@ All configuration is environment-based.
 | `CLAUDE_CWD` | process cwd | Working directory for the CLI. Use a neutral empty directory for an API-only setup; it keeps repository context out of the prompt. |
 | `CLAUDE_CODE_EXECUTABLE` | SDK default | Path to a specific Claude Code executable. |
 | `STATE_PATH` | `<claude config dir>/sub-to-api-sessions.json` | Persisted conversation → Claude session bindings. |
+| `PARKED_TURN_TTL_MS` | `1800000` | How long a tool turn waits for `tool_result` before its process is closed (`0` disables). |
 | `CLAUDE_CODE_MAX_RETRIES` | `0` | CLI API retries. Keep `0` so one API request maps to one model response; clients own retries. |
 
 ## Limitations
 
 - Authentication is a long-lived `CLAUDE_CODE_OAUTH_TOKEN`; the proxy does not refresh or persist it.
-- Session resume is best-effort: a missing session file, a changed model/system prompt, edited history, or a tool-result turn falls back to replaying the transcript. Cache reads still depend on the CLI's own cache-breakpoint placement.
+- Session resume is best-effort: a missing session file, a changed model/system prompt, or edited history falls back to replaying the transcript. Cache reads still depend on the CLI's own cache-breakpoint placement.
 - Sampling parameters (`temperature`, `top_p`, `top_k`) and `stop_sequences` are not exposed by the Agent SDK and are ignored. `max_tokens` sets the CLI's output ceiling; models that reason even with thinking disabled can spend part of that ceiling before answering, so the proxy gives short requests a 1024-token floor.
 - Thinking blocks are returned only when the request asks for thinking. Some models reason internally even when it is off; those blocks are dropped.
 - Images and documents are passed through as native content blocks. An unprocessable attachment becomes a `400 invalid_request_error`.

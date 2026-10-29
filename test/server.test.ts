@@ -7,6 +7,7 @@ import { createLogger } from "../src/logger.js";
 import type { Config } from "../src/config.js";
 import type { MessagesResponse } from "../src/anthropic/types.js";
 import { SessionStore } from "../src/session/store.js";
+import { ParkedTurnStore } from "../src/claude/parked.js";
 
 const config: Config = {
   listenAddr: ":0",
@@ -18,6 +19,7 @@ const config: Config = {
   maxConcurrency: 1,
   requestTimeoutMs: 60_000,
   defaultMaxTokens: 100,
+  parkedTurnTtlMs: 0,
 };
 
 const response: MessagesResponse = {
@@ -49,6 +51,7 @@ async function withServer(run: (base: string) => Promise<void>): Promise<void> {
     models: { list: async () => [{ type: "model", id: "claude-sonnet-5-5", display_name: "Sonnet", created_at: "2025-01-01T00:00:00Z" }] } as never,
     auth: { status: async () => ({ ok: true, detail: "test" }), cleanup: async () => {} },
     sessions: new SessionStore(undefined, createLogger("error")),
+    parked: new ParkedTurnStore(createLogger("error"), 0),
   });
   const server = createServer((req, res) => void handler(req, res));
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));

@@ -176,14 +176,6 @@ export class MessageAssembler {
       }
       this.usage = { ...this.usage, ...usageOf(event.usage) };
       this.emit(event);
-      // A completed tool_use message is the end of this API turn. Stop here,
-      // before the CLI executes the tool (it is denied anyway) or starts a
-      // second model call. The CLI's own message_stop follows; we synthesize
-      // it now so the stream is complete.
-      if (this.sawToolUse && this.stopReason === "tool_use" && !this.sawMessageStop) {
-        this.sawMessageStop = true;
-        this.emit({ type: "message_stop" });
-      }
       return;
     }
 
