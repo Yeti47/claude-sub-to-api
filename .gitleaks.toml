@@ -1,0 +1,19 @@
+# Gitleaks configuration.
+#
+# The default rule set is used everywhere. The only allowlist covers two files
+# that were deleted in the v1 -> v2 rewrite: they contained Claude Code's public
+# OAuth client identifier and public beta-header names, which the generic API-key
+# rule mistakes for credentials. Current code has no such exemptions.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Deleted v1 files with public OAuth client and beta-header identifiers"
+paths = [
+  '''internal/creds/manager\.go''',
+  '''internal/proxy/handler\.go''',
+]
+
+[[allowlists]]
+description = "Local secret store; .env is gitignored and never committed"
+paths = ['''^\.env$''']
