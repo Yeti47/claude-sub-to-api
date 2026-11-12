@@ -83,9 +83,6 @@ export class ModelCatalog {
       strictMcpConfig: true,
       settings: { disableClaudeAiConnectors: true },
     };
-    if (this.config.pathToClaudeCodeExecutable) {
-      options.pathToClaudeCodeExecutable = this.config.pathToClaudeCodeExecutable;
-    }
 
     const handle = query({ prompt: idle, options }) as unknown as {
       supportedModels?: () => Promise<

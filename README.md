@@ -21,6 +21,7 @@ Anthropic
 
 - `POST /v1/messages` turns the Messages API request into one Agent SDK turn. Claude runs with its normal Claude Code harness prompt; the client's system prompt is appended as turn instructions and takes precedence for that request. Built-in tools are disabled, and project settings/skills/MCP servers are not loaded.
 - The model is told plainly that it runs in `claude-sub-to-api` through the Claude Code harness, and that the tools come from the API client. Nothing pretends to be the Anthropic API or hides the harness.
+- Prompts are delivered verbatim: Claude Code does not expand `@path` mentions, run slash commands, or inject its own per-turn context. Auto-compaction, CLAUDE.md discovery, user hooks, tool search, the advisor tool, away summaries, and the non-streaming/refusal fallbacks are disabled, so the response is shaped only by this proxy and the API client.
 - Each conversation is bound to a persisted Claude session when possible. Resuming it, together with `excludeDynamicSections`, keeps the harness prompt stable and produced real prompt-cache reads in testing.
 - Conversation history is resumed from the bound Claude session when possible; otherwise it is replayed as a transcript. The final user turn, including images and documents, is passed through natively.
 - Client-defined `tools` are exposed to Claude as an in-process MCP server. When Claude calls one, the server returns a normal `tool_use` block and stops the turn. The client executes the tool and sends a follow-up request containing `tool_result`.
@@ -163,7 +164,6 @@ All configuration is environment-based.
 | `REQUEST_TIMEOUT_MS` | `900000` | Per-request upper bound. |
 | `DEFAULT_MAX_TOKENS` | `8192` | Output ceiling when `max_tokens` is omitted (the Messages API requires it). |
 | `CLAUDE_CWD` | process cwd | Working directory for the CLI. Use a neutral empty directory for an API-only setup; it keeps repository context out of the prompt. |
-| `CLAUDE_CODE_EXECUTABLE` | SDK default | Path to a specific Claude Code executable. |
 | `STATE_PATH` | `<claude config dir>/sub-to-api-sessions.json` | Persisted conversation → Claude session bindings. |
 | `PARKED_TURN_TTL_MS` | `1800000` | How long a tool turn waits for `tool_result` before its process is closed (`0` disables). |
 | `CLAUDE_CODE_MAX_RETRIES` | `0` | CLI API retries. Keep `0` so one API request maps to one model response; clients own retries. |

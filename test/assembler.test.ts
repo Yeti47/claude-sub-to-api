@@ -7,6 +7,7 @@ const bridge: ToolBridge = {
   mcpServers: {},
   toClientName: new Map([["mcp__claude_sub_to_api__search", "search"]]),
   exposedNames: ["mcp__claude_sub_to_api__search"],
+  beforeToolUse: () => {},
 };
 
 test("assembles a text message from stream events", () => {
@@ -87,6 +88,47 @@ test("maps MCP tool names and parses tool input", () => {
     id: "toolu_1",
     name: "search",
     input: { query: "x" },
+  });
+});
+
+test("keeps per-message usage instead of cumulative result usage", () => {
+  const assembler = new MessageAssembler("claude-sonnet-5-5", undefined);
+  assembler.handle({
+    type: "stream_event",
+    event: {
+      type: "message_start",
+      message: {
+        id: "msg_usage",
+        usage: { input_tokens: 10, cache_read_input_tokens: 5, output_tokens: 0 },
+      },
+    },
+  });
+  assembler.handle({
+    type: "stream_event",
+    event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+  });
+  assembler.handle({
+    type: "stream_event",
+    event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } },
+  });
+  assembler.handle({ type: "stream_event", event: { type: "content_block_stop", index: 0 } });
+  assembler.handle({
+    type: "stream_event",
+    event: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 2 } },
+  });
+  assembler.handle({
+    type: "result",
+    subtype: "success",
+    is_error: false,
+    result: "hi",
+    stop_reason: "end_turn",
+    usage: { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 70 },
+  });
+
+  assert.deepEqual(assembler.response().usage, {
+    input_tokens: 10,
+    output_tokens: 2,
+    cache_read_input_tokens: 5,
   });
 });
 

@@ -28,11 +28,19 @@ interface Phase {
   registered: PendingToolCall[];
   waiting: Set<PendingToolCall>;
   byId: Map<string, PendingToolCall>;
+  /** IDs from PreToolUse, queued per client tool name. */
+  idsByName: Map<string, string[]>;
   resolvers: Array<() => void>;
 }
 
 function newPhase(): Phase {
-  return { registered: [], waiting: new Set(), byId: new Map(), resolvers: [] };
+  return {
+    registered: [],
+    waiting: new Set(),
+    byId: new Map(),
+    idsByName: new Map(),
+    resolvers: [],
+  };
 }
 
 export class PendingToolRegistry {
@@ -43,6 +51,13 @@ export class PendingToolRegistry {
     this.phase = newPhase();
   }
 
+  /** Record a PreToolUse id before its MCP handler runs. */
+  queueId(name: string, toolUseId: string): void {
+    const queue = this.phase.idsByName.get(name) ?? [];
+    queue.push(toolUseId);
+    this.phase.idsByName.set(name, queue);
+  }
+
   register(name: string, args: Record<string, unknown>): Promise<CallToolResult> {
     let resolve!: (result: CallToolResult) => void;
     let reject!: (error: Error) => void;
@@ -50,13 +65,16 @@ export class PendingToolRegistry {
       resolve = res;
       reject = rej;
     });
+    const queuedId = this.phase.idsByName.get(name)?.shift();
     const call: PendingToolCall = {
       name,
       args: args ?? {},
+      ...(queuedId ? { toolUseId: queuedId } : {}),
       result,
       resolve: (value) => resolve(value),
       reject: (error) => reject(error),
     };
+    if (queuedId) this.phase.byId.set(queuedId, call);
     const phase = this.phase;
     phase.registered.push(call);
     phase.waiting.add(call);

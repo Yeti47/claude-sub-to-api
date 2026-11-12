@@ -77,8 +77,45 @@ test("runs a text turn and configures a constrained SDK session", async () => {
   assert.equal(options?.maxTurns, 1);
   assert.equal(options?.persistSession, true);
   assert.deepEqual(options?.settingSources, []);
-  assert.equal((options?.env as Record<string, string>).CLAUDE_CODE_MAX_OUTPUT_TOKENS, "1024");
-  assert.equal((options?.env as Record<string, string>).CLAUDE_CONFIG_DIR, "/tmp/claude-test");
+  assert.equal(options?.verbatimPrompts, true);
+  assert.deepEqual(options?.settings, { disableAllHooks: true });
+  const env = options?.env as Record<string, string>;
+  assert.equal(env.CLAUDE_CODE_MAX_OUTPUT_TOKENS, "1024");
+  assert.equal(env.CLAUDE_CONFIG_DIR, "/tmp/claude-test");
+  assert.equal(env.CLAUDE_CODE_DISABLE_AUTO_MEMORY, "1");
+  assert.equal(env.CLAUDE_CODE_DISABLE_CLAUDE_MDS, "1");
+  assert.equal(env.DISABLE_AUTO_COMPACT, "1");
+  assert.equal(env.CLAUDE_CODE_ENABLE_AWAY_SUMMARY, "0");
+  assert.equal(env.ENABLE_TOOL_SEARCH, "false");
+  assert.equal(env.CLAUDE_CODE_DISABLE_ADVISOR_TOOL, "1");
+  assert.equal(env.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK, "1");
+  assert.equal(env.CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK, "1");
+  assert.equal(env.MAX_MCP_OUTPUT_TOKENS, "200000");
+  assert.equal(env.CLAUDE_CODE_POLISHED_DEWDROP, "drop");
+  assert.equal(env.CLAUDE_CODE_SIMPLE, undefined);
+  assert.equal(env.CLAUDE_CODE_EFFORT_LEVEL, undefined);
+  assert.equal(env.MCP_TOOL_TIMEOUT, undefined);
+  assert.deepEqual(options?.thinking, { type: "disabled" });
+});
+
+test("uses summarized adaptive thinking when requested", async () => {
+  let options: Record<string, unknown> | undefined;
+  const runner = new ClaudeRunner(
+    config,
+    createLogger("error"),
+    fakeQuery(textEvents, (value) => (options = value)) as never,
+  );
+  await runner.run({
+    request: {
+      model: "claude-sonnet-5-5",
+      messages: [{ role: "user", content: "hi" }],
+      thinking: { type: "adaptive" },
+    },
+    signal: new AbortController().signal,
+    requestId: "r-thinking",
+    stream: false,
+  });
+  assert.deepEqual(options?.thinking, { type: "adaptive", display: "summarized" });
 });
 
 test("parks a tool_use turn and resumes it with the client result", async () => {
@@ -108,26 +145,36 @@ test("parks a tool_use turn and resumes it with the client result", async () => 
     { type: "result", subtype: "success", is_error: false, result: "done", stop_reason: "end_turn", usage: { input_tokens: 6, output_tokens: 1 } },
   ];
 
-  const queryFn = () => ({
-    async *[Symbol.asyncIterator]() {
-      let call: Promise<unknown> | undefined;
-      for (const event of toolEvents) {
-        if (
-          event.type === "stream_event" &&
-          (event.event as { type?: string }).type === "message_stop"
-        ) {
-          // Simulate the CLI invoking the MCP handler after message_stop.
-          setTimeout(() => {
-            call = pending!.register("lookup", { q: "x" });
-          }, 0);
+  const queryFn = (params: { options: Record<string, unknown> }) => {
+    const hooks = params.options.hooks as
+      | { PreToolUse?: Array<{ hooks: Array<(input: Record<string, unknown>) => Promise<unknown>> }> }
+      | undefined;
+    void hooks?.PreToolUse?.[0]?.hooks[0]?.({
+      hook_event_name: "PreToolUse",
+      tool_name: "mcp__claude_sub_to_api__lookup",
+      tool_use_id: "t1",
+    });
+    return {
+      async *[Symbol.asyncIterator]() {
+        let call: Promise<unknown> | undefined;
+        for (const event of toolEvents) {
+          if (
+            event.type === "stream_event" &&
+            (event.event as { type?: string }).type === "message_stop"
+          ) {
+            // Simulate the CLI invoking the MCP handler after message_stop.
+            setTimeout(() => {
+              call = pending!.register("lookup", { q: "x" });
+            }, 0);
+          }
+          yield event;
         }
-        yield event;
-      }
-      await call;
-      for (const event of continuation) yield event;
-    },
-    close() {},
-  });
+        await call;
+        for (const event of continuation) yield event;
+      },
+      close() {},
+    };
+  };
 
   const runner = new ClaudeRunner(
     config,
@@ -149,6 +196,7 @@ test("parks a tool_use turn and resumes it with the client result", async () => 
   });
 
   assert.ok(first.parked);
+  assert.equal(pending!.calls()[0]?.toolUseId, "t1");
   assert.equal(first.response.stop_reason, "tool_use");
   assert.deepEqual(first.response.content[0], {
     type: "tool_use",
@@ -173,6 +221,43 @@ test("parks a tool_use turn and resumes it with the client result", async () => 
   });
   assert.equal(second.parked, undefined);
   assert.deepEqual(second.response.content[0], { type: "text", text: "done" });
+});
+
+test("maps upstream HTTP statuses to Anthropic error statuses", async () => {
+  const cases: Array<[number, number, string]> = [
+    [529, 529, "overloaded_error"],
+    [401, 401, "authentication_error"],
+    [404, 404, "not_found_error"],
+    [400, 400, "invalid_request_error"],
+  ];
+  for (const [upstream, expected, type] of cases) {
+    const runner = new ClaudeRunner(
+      config,
+      createLogger("error"),
+      fakeQuery([
+        {
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          api_error_status: upstream,
+          result: `upstream ${upstream}`,
+          stop_reason: null,
+          usage: {},
+        },
+      ]) as never,
+    );
+    await assert.rejects(
+      () =>
+        runner.run({
+          request: { model: "m", messages: [{ role: "user", content: "hi" }] },
+          signal: new AbortController().signal,
+          requestId: `r-${upstream}`,
+          stream: false,
+        }),
+      (error: unknown) =>
+        error instanceof ApiError && error.status === expected && error.type === type,
+    );
+  }
 });
 
 test("turns an SDK rate-limit result into a 429", async () => {

@@ -32,6 +32,27 @@ test("builds an in-process MCP server and a reverse name map", () => {
   assert.ok(bridge?.mcpServers[MCP_SERVER_NAME]);
 });
 
+test("uses the PreToolUse id for the matching handler", () => {
+  const pending = new PendingToolRegistry();
+  const bridge = buildToolBridge(
+    [
+      {
+        name: "lookup",
+        input_schema: { type: "object", properties: { query: { type: "string" } } },
+      },
+    ],
+    pending,
+  );
+  bridge!.beforeToolUse(`${MCP_TOOL_PREFIX}lookup`, "toolu_1");
+  void pending.register("lookup", { query: "x" });
+  assert.equal(pending.calls()[0]?.toolUseId, "toolu_1");
+  assert.deepEqual(pending.pendingIds(), ["toolu_1"]);
+
+  pending.beginPhase();
+  assert.equal(pending.calls().length, 0);
+  assert.deepEqual(pending.pendingIds(), []);
+});
+
 test("empty tool lists produce no MCP server", () => {
   assert.equal(buildToolBridge([], new PendingToolRegistry()), undefined);
 });

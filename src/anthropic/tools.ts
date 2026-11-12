@@ -24,6 +24,8 @@ export interface ToolBridge {
   toClientName: Map<string, string>;
   /** Names as Claude Code will see them, for allowedTools. */
   exposedNames: string[];
+  /** Record a PreToolUse id so its MCP handler can take the exact id. */
+  beforeToolUse(sdkName: string, toolUseId: string): void;
 }
 
 /** MCP tool names are restricted; keep a reversible, collision-free mapping. */
@@ -97,7 +99,10 @@ export function buildToolBridge(
     description: definition.description || definition.name,
     inputSchema: definition.input_schema ?? { type: "object", properties: {} },
     annotations: { readOnlyHint: true },
-    _meta: { "anthropic/alwaysLoad": true },
+    _meta: {
+      "anthropic/alwaysLoad": true,
+      "anthropic/maxResultSizeChars": 500_000,
+    },
   }));
 
   const server = createSdkMcpServer({
@@ -122,6 +127,9 @@ export function buildToolBridge(
     mcpServers: { [MCP_SERVER_NAME]: server },
     toClientName,
     exposedNames,
+    beforeToolUse(sdkName, toolUseId) {
+      pending.queueId(toClientName.get(sdkName) ?? sdkName, toolUseId);
+    },
   };
 }
 

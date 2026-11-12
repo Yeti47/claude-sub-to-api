@@ -26,8 +26,6 @@ export interface Config {
   requestTimeoutMs: number;
   /** Default output-token ceiling, matching the Anthropic API default. */
   defaultMaxTokens: number;
-  /** Optional explicit path to the Claude Code executable. */
-  pathToClaudeCodeExecutable?: string;
   /** Optional path for persisted conversation -> Claude session bindings. */
   statePath?: string;
   /** How long a turn may wait for client tool results before it is closed. */
@@ -78,7 +76,6 @@ export function loadConfig(envVars: NodeJS.ProcessEnv = process.env): Config {
     maxConcurrency: intEnv("MAX_CONCURRENCY", 4, 1, 64),
     requestTimeoutMs: intEnv("REQUEST_TIMEOUT_MS", 15 * 60_000, 10_000, 3_600_000),
     defaultMaxTokens: intEnv("DEFAULT_MAX_TOKENS", 8192, 1, 64_000),
-    pathToClaudeCodeExecutable: envVars.CLAUDE_CODE_EXECUTABLE?.trim() || undefined,
     statePath: envVars.STATE_PATH?.trim() || undefined,
     parkedTurnTtlMs: intEnv("PARKED_TURN_TTL_MS", 30 * 60_000, 0, 24 * 60 * 60_000),
   };
