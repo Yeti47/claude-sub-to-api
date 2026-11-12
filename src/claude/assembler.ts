@@ -338,6 +338,7 @@ export class MessageAssembler {
     }
     if (typeof msg.api_error_status === "number" && msg.api_error_status >= 400) {
       this.apiErrorStatus = msg.api_error_status;
+      this.fatalError = true;
     }
     if (msg.is_error === true || msg.subtype !== "success" || this.apiErrorStatus !== undefined) {
       const errors = Array.isArray(msg.errors) ? msg.errors.join("; ") : "";
