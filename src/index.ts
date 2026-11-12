@@ -81,6 +81,7 @@ async function main(): Promise<void> {
     force.unref();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     clearTimeout(force);
+    runner.closeAll("Server shutting down");
     parked.closeAll("Server shutting down");
     parked.stop();
     await auth.cleanup();

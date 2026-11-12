@@ -20,6 +20,7 @@ const config: Config = {
   requestTimeoutMs: 60_000,
   defaultMaxTokens: 100,
   parkedTurnTtlMs: 0,
+  sessionIdleMs: 0,
 };
 
 const response: MessagesResponse = {

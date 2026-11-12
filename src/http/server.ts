@@ -180,6 +180,7 @@ export function createHandler(deps: Deps) {
         deps.parked.remove(parked);
         parkedResumed = true;
         result = await parked.resume({
+          conversationKey: key,
           request,
           signal: controller.signal,
           requestId,
@@ -192,6 +193,7 @@ export function createHandler(deps: Deps) {
       } else {
         deps.parked.close(key, "Superseded by a new request");
         result = await deps.runner.run({
+          conversationKey: key,
           request,
           signal: controller.signal,
           requestId,
@@ -227,6 +229,7 @@ export function createHandler(deps: Deps) {
         stream,
         status: 200,
         resumed: Boolean(plan) || parkedResumed,
+        reused: Boolean(result.reused),
         parked: Boolean(result.parked),
         sessionId: result.sessionId,
         ms: Date.now() - started,

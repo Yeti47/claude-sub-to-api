@@ -20,6 +20,7 @@ import {
   type PendingToolCall,
 } from "./pending-tools.js";
 import { ParkedTurn, type ResumeParkedInput } from "./parked.js";
+import { TurnInput } from "./turn-input.js";
 
 export class ApiError extends Error {
   constructor(readonly status: number, readonly type: string, message: string) {
@@ -50,6 +51,8 @@ function isMissingSession(error: unknown): boolean {
 }
 
 export interface RunInput {
+  /** Stable conversation identity; one live process per key. */
+  conversationKey: string;
   request: MessagesRequest;
   signal: AbortSignal;
   requestId: string;
@@ -68,18 +71,26 @@ export interface RunResult {
   sessionId?: string;
   /** Set when the turn stopped on a tool call and waits for client results. */
   parked?: ParkedTurn;
+  /** Whether this turn reused an already-running Claude process. */
+  reused?: boolean;
 }
 
 interface TurnState {
+  key: string;
   model: string;
   bridge?: ToolBridge;
   pending: PendingToolRegistry;
+  input: TurnInput;
   handle: QueryHandle;
   iterator: AsyncIterator<SDKMessage>;
   controller: AbortController;
   includeThinking: boolean;
   release: () => void;
   sessionId?: string;
+  launchKey: string;
+  busy: boolean;
+  lastUsed: number;
+  idleTimer?: ReturnType<typeof setTimeout>;
   closed: boolean;
 }
 
@@ -91,11 +102,6 @@ export type QueryFactory = (params: {
   prompt: AsyncIterable<SDKUserMessage>;
   options: Record<string, unknown>;
 }) => QueryHandle;
-
-/** One-message streaming input; the SDK requires an iterable for rich content. */
-async function* singlePrompt(message: SDKUserMessage): AsyncIterable<SDKUserMessage> {
-  yield message;
-}
 
 function thinkingOption(request: MessagesRequest, maxTokens: number): Record<string, unknown> {
   const thinking = request.thinking;
@@ -230,48 +236,119 @@ export class ClaudeRunner {
     return env;
   }
 
+  private readonly processes = new Map<string, TurnState>();
+  private readonly locks = new Map<string, Promise<void>>();
+
   async run(input: RunInput): Promise<RunResult> {
-    let release: (() => void) | undefined;
-    try {
-      release = await this.limit.acquire(input.signal);
-    } catch {
-      throw new ClientAbort();
-    }
-    let result: RunResult;
-    try {
-      try {
-        result = await this.runInner(input, release);
-      } catch (error) {
-        if (error instanceof ResumeFailed) {
-          this.logger.warn("Claude session could not be resumed; replaying history", {
-            requestId: input.requestId,
-            sessionId: input.resumeSessionId,
-          });
-          result = await this.runInner(
-            { ...input, resumeSessionId: undefined, resumeFromIndex: undefined },
-            release,
-          );
-        } else {
-          throw error;
-        }
-      }
-    } catch (error) {
-      release();
-      throw error;
-    }
-    // A parked turn keeps its CLI process and concurrency slot alive until
-    // the client returns tool results or the TTL closes it.
-    if (!result.parked) release();
-    return result;
+    return this.withLock(input.conversationKey, () => this.runLocked(input));
   }
 
-  private async runInner(input: RunInput, release: () => void): Promise<RunResult> {
-    const { request, signal, requestId, stream, onEvent } = input;
-    const prepared = prepareTurn(request, {
+  private async runLocked(input: RunInput): Promise<RunResult> {
+    if (input.signal.aborted) throw new ClientAbort();
+    let prepared = prepareTurn(input.request, {
       resumeFromIndex: input.resumeFromIndex,
     });
-    const pending = this.createPending();
-    const bridge = buildToolBridge(prepared.tools, pending);
+    let launchKey = this.launchKey(input.request, prepared);
+    let state = this.processes.get(input.conversationKey);
+
+    if (state) {
+      const sameSession =
+        !input.resumeSessionId || !state.sessionId || state.sessionId === input.resumeSessionId;
+      const compatible =
+        !state.closed &&
+        state.launchKey === launchKey &&
+        input.resumeFromIndex !== undefined &&
+        sameSession;
+      if (!compatible) {
+        this.closeState(state, "Session configuration or history changed");
+        state = undefined;
+      }
+    }
+
+    try {
+      if (state) {
+        this.cancelIdle(state);
+        if (input.signal.aborted) throw new ClientAbort();
+        state.busy = true;
+        state.lastUsed = Date.now();
+        state.pending.beginPhase();
+        state.input.push({ ...prepared.prompt, uuid: randomUUID() } as SDKUserMessage);
+        const result = await this.consume(state, { ...input, resumeSessionId: undefined });
+        return { ...result, reused: true };
+      }
+      return await this.startProcess(input, prepared, launchKey);
+    } catch (error) {
+      if (error instanceof ResumeFailed) {
+        this.logger.warn("Claude session could not be resumed; replaying history", {
+          requestId: input.requestId,
+          sessionId: input.resumeSessionId,
+        });
+        const fresh = {
+          ...input,
+          resumeSessionId: undefined,
+          resumeFromIndex: undefined,
+        };
+        prepared = prepareTurn(input.request);
+        launchKey = this.launchKey(input.request, prepared);
+        return this.startProcess(fresh, prepared, launchKey);
+      }
+      throw error;
+    }
+  }
+
+  private async startProcess(
+    input: RunInput,
+    prepared: ReturnType<typeof prepareTurn>,
+    launchKey: string,
+  ): Promise<RunResult> {
+    const release = await this.acquireSlot(input.signal);
+    let state: TurnState | undefined;
+    try {
+      const pending = this.createPending();
+      const bridge = buildToolBridge(prepared.tools, pending);
+      const controller = new AbortController();
+      const inputQueue = new TurnInput();
+      const options = this.queryOptions(input, prepared, bridge, controller);
+      const handle = this.queryFn({ prompt: inputQueue, options });
+      state = {
+        key: input.conversationKey,
+        model: input.request.model,
+        bridge,
+        pending,
+        input: inputQueue,
+        handle,
+        iterator: handle[Symbol.asyncIterator](),
+        controller,
+        includeThinking:
+          input.request.thinking?.type === "enabled" ||
+          input.request.thinking?.type === "adaptive",
+        release,
+        sessionId:
+          input.resumeSessionId && input.resumeFromIndex !== undefined
+            ? input.resumeSessionId
+            : undefined,
+        launchKey,
+        busy: true,
+        lastUsed: Date.now(),
+        closed: false,
+      };
+      this.processes.set(input.conversationKey, state);
+      inputQueue.push({ ...prepared.prompt, uuid: randomUUID() } as SDKUserMessage);
+      return await this.consume(state, input);
+    } catch (error) {
+      if (state) this.closeState(state, "Failed to start turn");
+      else release();
+      throw error;
+    }
+  }
+
+  private queryOptions(
+    input: RunInput,
+    prepared: ReturnType<typeof prepareTurn>,
+    bridge: ToolBridge | undefined,
+    controller: AbortController,
+  ): Record<string, unknown> {
+    const { request, requestId } = input;
     const maxTokens = Math.min(
       Math.max(1, request.max_tokens ?? this.config.defaultMaxTokens),
       64_000,
@@ -283,10 +360,6 @@ export class ClaudeRunner {
       request.thinking?.type === "enabled" || request.thinking?.type === "adaptive"
         ? maxTokens
         : Math.max(maxTokens, 1024);
-
-    const system = prepared.system;
-    const systemOption = systemPromptOption(system);
-    const controller = new AbortController();
 
     const options: Record<string, unknown> = {
       cwd: this.config.cwd,
@@ -307,6 +380,7 @@ export class ClaudeRunner {
       abortController: controller,
       stderr: (line: string) => this.logger.debug("claude stderr", { requestId, line }),
     };
+    const systemOption = systemPromptOption(prepared.system);
     if (systemOption) options.systemPrompt = systemOption;
     const effort = request.output_config?.effort;
     if (
@@ -317,8 +391,6 @@ export class ClaudeRunner {
     }
     if (bridge) {
       options.mcpServers = bridge.mcpServers;
-      // The CLI must be allowed to call the in-process handlers; they block
-      // until the API client returns the tool result.
       options.allowedTools = bridge.exposedNames;
       options.hooks = {
         PreToolUse: [
@@ -338,27 +410,86 @@ export class ClaudeRunner {
           },
         ],
       };
-    } else {
-      // A text-only turn needs exactly one assistant message.
-      options.maxTurns = 1;
     }
     if (input.resumeSessionId && input.resumeFromIndex !== undefined) {
       options.resume = input.resumeSessionId;
     }
-    const handle = this.queryFn({ prompt: singlePrompt(prepared.prompt), options });
-    const state: TurnState = {
+    return options;
+  }
+
+  private launchKey(
+    request: MessagesRequest,
+    prepared: ReturnType<typeof prepareTurn>,
+  ): string {
+    const maxTokens = Math.min(
+      Math.max(1, request.max_tokens ?? this.config.defaultMaxTokens),
+      64_000,
+    );
+    return stableStringify({
       model: request.model,
-      bridge,
-      pending,
-      handle,
-      iterator: handle[Symbol.asyncIterator](),
-      controller,
-      includeThinking:
-        request.thinking?.type === "enabled" || request.thinking?.type === "adaptive",
-      release,
-      closed: false,
-    };
-    return this.consume(state, input);
+      system: prepared.system ?? null,
+      tools: prepared.tools,
+      maxTokens,
+      thinking: thinkingOption(request, maxTokens),
+      effort: request.output_config?.effort ?? null,
+      cwd: this.config.cwd,
+      configDir: this.config.claudeConfigDir,
+    });
+  }
+
+  private async acquireSlot(signal: AbortSignal): Promise<() => void> {
+    if (this.processes.size >= this.config.maxConcurrency) {
+      const idle = [...this.processes.values()]
+        .filter((state) => !state.busy && !state.closed)
+        .sort((a, b) => a.lastUsed - b.lastUsed)[0];
+      if (idle) this.closeState(idle, "Evicted idle session");
+    }
+    try {
+      return await this.limit.acquire(signal);
+    } catch {
+      throw new ClientAbort();
+    }
+  }
+
+  private async withLock<T>(key: string, run: () => Promise<T>): Promise<T> {
+    const previous = this.locks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => gate);
+    this.locks.set(key, tail);
+    await previous;
+    try {
+      return await run();
+    } finally {
+      release();
+      if (this.locks.get(key) === tail) this.locks.delete(key);
+    }
+  }
+
+  private cancelIdle(state: TurnState): void {
+    if (!state.idleTimer) return;
+    clearTimeout(state.idleTimer);
+    state.idleTimer = undefined;
+  }
+
+  private armIdle(state: TurnState): void {
+    this.cancelIdle(state);
+    if (state.closed || state.busy) return;
+    if (this.config.sessionIdleMs <= 0) {
+      this.closeState(state, "Idle session closed");
+      return;
+    }
+    state.idleTimer = setTimeout(() => {
+      state.idleTimer = undefined;
+      if (!state.busy && !state.closed) this.closeState(state, "Idle session closed");
+    }, this.config.sessionIdleMs);
+    state.idleTimer.unref?.();
+  }
+
+  closeAll(reason = "Server shutting down"): void {
+    for (const state of [...this.processes.values()]) this.closeState(state, reason);
   }
 
   private async consume(state: TurnState, input: RunInput): Promise<RunResult> {
@@ -374,11 +505,15 @@ export class ClaudeRunner {
     };
     input.signal.addEventListener("abort", onAbort, { once: true });
     let lastMessage: Record<string, unknown> | undefined;
+    let ended = false;
 
     try {
       while (true) {
         const next = await state.iterator.next();
-        if (next.done) break;
+        if (next.done) {
+          ended = true;
+          break;
+        }
         const message = next.value;
         lastMessage = message as Record<string, unknown>;
         this.logger.debug("sdk message", {
@@ -402,6 +537,7 @@ export class ClaudeRunner {
           if (!matchToolCalls(blocks, state.pending.calls(), state.pending)) {
             throw new ApiError(502, "api_error", "Claude requested a tool the bridge could not match");
           }
+          state.busy = true;
           return { response, sessionId: state.sessionId, parked: this.makeParked(state) };
         }
         if (lastMessage.type === "result") break;
@@ -444,17 +580,19 @@ export class ClaudeRunner {
       }
     }
     const response = assembler.response();
-    this.closeState(state, "Turn finished");
+    state.sessionId = assembler.sessionId ?? state.sessionId;
+    state.busy = false;
+    state.lastUsed = Date.now();
+    if (ended) this.closeState(state, "Claude process ended");
+    else this.armIdle(state);
     return { response, sessionId: state.sessionId };
   }
 
   private makeParked(state: TurnState): ParkedTurn {
     return new ParkedTurn(randomUUID(), state.sessionId, state.pending, {
-      resume: (input) => this.resumeParked(state, input),
-      close: (reason) => {
-        this.closeState(state, reason);
-        state.release();
-      },
+      resume: (input) =>
+        this.withLock(state.key, () => this.resumeParked(state, input)),
+      close: (reason) => this.closeState(state, reason),
     });
   }
 
@@ -472,12 +610,10 @@ export class ClaudeRunner {
     }
     state.pending.beginPhase();
     try {
-      const result = await this.consume(state, input);
-      if (!result.parked) state.release();
-      return result;
+      const result = await this.consume(state, { ...input, resumeSessionId: undefined });
+      return { ...result, reused: true };
     } catch (error) {
       this.closeState(state, "Tool continuation failed");
-      state.release();
       throw error;
     }
   }
@@ -485,12 +621,16 @@ export class ClaudeRunner {
   private closeState(state: TurnState, reason: string): void {
     if (state.closed) return;
     state.closed = true;
+    this.cancelIdle(state);
     state.pending.rejectAll(new Error(reason));
+    state.input.end();
     try {
       state.handle.close?.();
     } catch {
       // already closed
     }
+    if (this.processes.get(state.key) === state) this.processes.delete(state.key);
+    state.release();
   }
 }
 
