@@ -510,7 +510,7 @@ function matchToolCalls(
   pending: PendingToolRegistry,
 ): boolean {
   const linked = new Set(calls.map((call) => call.toolUseId).filter(Boolean));
-  const remaining = [...calls];
+  const remaining = calls.filter((call) => !call.toolUseId);
   for (const block of blocks) {
     if (linked.has(block.id)) continue;
     let index = remaining.findIndex(
