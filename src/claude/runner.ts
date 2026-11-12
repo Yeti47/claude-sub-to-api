@@ -100,18 +100,42 @@ async function* singlePrompt(message: SDKUserMessage): AsyncIterable<SDKUserMess
 function thinkingOption(request: MessagesRequest, maxTokens: number): Record<string, unknown> {
   const thinking = request.thinking;
   if (!thinking || thinking.type === "disabled") return { type: "disabled" };
-  if (thinking.type === "adaptive") return { type: "adaptive" };
+  if (thinking.type === "adaptive") return { type: "adaptive", display: "summarized" };
   const budget = Number(thinking.budget_tokens ?? 0);
   const limit = maxTokens - 1;
-  if (budget <= 0 || limit < 1024) return { type: "adaptive" };
-  return { type: "enabled", budgetTokens: Math.min(Math.max(1024, budget), limit) };
+  if (budget <= 0 || limit < 1024) return { type: "adaptive", display: "summarized" };
+  return {
+    type: "enabled",
+    budgetTokens: Math.min(Math.max(1024, budget), limit),
+    display: "summarized",
+  };
 }
 
-function errorFor(result: { type: string; message: string }): ApiError {
+function errorFor(result: {
+  type: string;
+  message: string;
+  status?: number;
+  resetAt?: number;
+}): ApiError {
   const type = result.type.toLowerCase();
   const haystack = `${type} ${result.message}`.toLowerCase();
-  if (haystack.includes("rate_limit")) return new ApiError(429, "rate_limit_error", result.message);
-  if (haystack.includes("overloaded")) return new ApiError(529, "overloaded_error", result.message);
+  const reset = result.resetAt
+    ? ` Resets at ${new Date(result.resetAt).toISOString()}.`
+    : "";
+  const message = `${result.message}${reset}`;
+
+  if (result.status !== undefined) {
+    if (result.status === 401) return new ApiError(401, "authentication_error", message);
+    if (result.status === 403) return new ApiError(403, "permission_error", message);
+    if (result.status === 404) return new ApiError(404, "not_found_error", message);
+    if (result.status === 429) return new ApiError(429, "rate_limit_error", message);
+    if (result.status === 529) return new ApiError(529, "overloaded_error", message);
+    if (result.status >= 500) return new ApiError(502, "api_error", message);
+    if (result.status >= 400) return new ApiError(400, "invalid_request_error", message);
+  }
+
+  if (haystack.includes("rate_limit")) return new ApiError(429, "rate_limit_error", message);
+  if (haystack.includes("overloaded")) return new ApiError(529, "overloaded_error", message);
   if (
     haystack.includes("authentication") ||
     haystack.includes("authenticate") ||
@@ -119,11 +143,12 @@ function errorFor(result: { type: string; message: string }): ApiError {
     haystack.includes("credential") ||
     haystack.includes("login")
   )
-    return new ApiError(401, "authentication_error", result.message);
-  if (type.includes("model_not_found")) return new ApiError(404, "not_found_error", result.message);
-  if (type.includes("invalid_request")) return new ApiError(400, "invalid_request_error", result.message);
-  if (type.includes("refusal")) return new ApiError(400, "invalid_request_error", result.message);
-  return new ApiError(502, "api_error", result.message);
+    return new ApiError(401, "authentication_error", message);
+  if (haystack.includes("permission")) return new ApiError(403, "permission_error", message);
+  if (type.includes("model_not_found")) return new ApiError(404, "not_found_error", message);
+  if (type.includes("invalid_request")) return new ApiError(400, "invalid_request_error", message);
+  if (type.includes("refusal")) return new ApiError(400, "invalid_request_error", message);
+  return new ApiError(502, "api_error", message);
 }
 
 const RUNTIME_NOTE = [
@@ -178,7 +203,23 @@ export class ClaudeRunner {
     }
     env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(maxTokens);
     env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
+    env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
     env.CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH = "8192";
+    // Claude Code features that duplicate this proxy's own behavior, or that
+    // would change the response shape without the API client knowing.
+    env.DISABLE_AUTO_COMPACT = "1";
+    env.CLAUDE_CODE_ENABLE_AWAY_SUMMARY = "0";
+    env.ENABLE_TOOL_SEARCH = "false";
+    env.CLAUDE_CODE_DISABLE_ADVISOR_TOOL = "1";
+    env.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK = "1";
+    env.CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK = "1";
+    env.MAX_MCP_OUTPUT_TOKENS = "200000";
+    // A resumed session may see a different system prompt or tools; drop
+    // thinking blocks bound to the old prompt instead of failing the request.
+    env.CLAUDE_CODE_POLISHED_DEWDROP = "drop";
+    delete env.CLAUDE_CODE_SIMPLE;
+    delete env.CLAUDE_CODE_EFFORT_LEVEL;
+    delete env.MCP_TOOL_TIMEOUT;
     // The API client owns retries. Hidden CLI retries would produce several
     // model messages for one API request, which cannot be represented as one
     // Anthropic response (especially in a stream).
@@ -259,6 +300,10 @@ export class ClaudeRunner {
       tools: [],
       permissionMode: "dontAsk",
       thinking: thinkingOption(request, maxTokens),
+      // Deliver prompts exactly as sent: do not expand @paths, run /commands,
+      // or inject Claude Code's own per-turn context.
+      verbatimPrompts: true,
+      settings: { disableAllHooks: true },
       abortController: controller,
       stderr: (line: string) => this.logger.debug("claude stderr", { requestId, line }),
     };
@@ -275,23 +320,31 @@ export class ClaudeRunner {
       // The CLI must be allowed to call the in-process handlers; they block
       // until the API client returns the tool result.
       options.allowedTools = bridge.exposedNames;
+      options.hooks = {
+        PreToolUse: [
+          {
+            hooks: [
+              async (input: Record<string, unknown>) => {
+                if (
+                  input.hook_event_name === "PreToolUse" &&
+                  typeof input.tool_name === "string" &&
+                  typeof input.tool_use_id === "string"
+                ) {
+                  bridge.beforeToolUse(input.tool_name, input.tool_use_id);
+                }
+                return {};
+              },
+            ],
+          },
+        ],
+      };
     } else {
       // A text-only turn needs exactly one assistant message.
       options.maxTurns = 1;
     }
-    if (this.config.pathToClaudeCodeExecutable) {
-      options.pathToClaudeCodeExecutable = this.config.pathToClaudeCodeExecutable;
-    }
     if (input.resumeSessionId && input.resumeFromIndex !== undefined) {
       options.resume = input.resumeSessionId;
     }
-    // The CLI hides reasoning by default; when the client asked for thinking,
-    // ask for summaries so the thinking blocks are not empty.
-    if (request.thinking?.type === "enabled" || request.thinking?.type === "adaptive") {
-      options.settings = { showThinkingSummaries: true };
-      options.extraArgs = { "thinking-display": "summarized" };
-    }
-
     const handle = this.queryFn({ prompt: singlePrompt(prepared.prompt), options });
     const state: TurnState = {
       model: request.model,
@@ -456,8 +509,10 @@ function matchToolCalls(
   calls: PendingToolCall[],
   pending: PendingToolRegistry,
 ): boolean {
+  const linked = new Set(calls.map((call) => call.toolUseId).filter(Boolean));
   const remaining = [...calls];
   for (const block of blocks) {
+    if (linked.has(block.id)) continue;
     let index = remaining.findIndex(
       (call) =>
         call.name === block.name && stableStringify(call.args) === stableStringify(block.input),

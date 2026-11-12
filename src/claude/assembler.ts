@@ -27,6 +27,21 @@ function usageOf(raw: unknown): Partial<Usage> {
   return usage;
 }
 
+function mergeUsage(current: Usage, raw: unknown): Usage {
+  const next = { ...current };
+  const incoming = usageOf(raw);
+  for (const key of [
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+  ] as const) {
+    const value = incoming[key];
+    if (value !== undefined) next[key] = Math.max(next[key] ?? 0, value);
+  }
+  return next;
+}
+
 function classifySynthetic(text: string): string {
   const lower = text.toLowerCase();
   if (/authenticat|oauth|credential|login|sign in|sign-in/.test(lower)) return "authentication_failed";
@@ -47,10 +62,14 @@ export class MessageAssembler {
   sawToolUse = false;
   sawMessageStop = false;
   sawStreamEvents = false;
+  sawMessageStart = false;
   sessionId?: string;
-  resultError: { type: string; message: string } | null = null;
+  resultError: { type: string; message: string; status?: number; resetAt?: number } | null = null;
   /** A CLI-level notice (not model output) that must fail the request. */
   fatalError = false;
+  private apiErrorStatus?: number;
+  private rateLimitResetAt?: number;
+  private assistantError?: string;
   private blocks = new Map<number, BlockState>();
   private indexMap = new Map<number, number>();
   private suppressed = new Set<number>();
@@ -82,6 +101,13 @@ export class MessageAssembler {
       case "result":
         this.handleResult(msg);
         break;
+      case "rate_limit_event": {
+        const info = msg.rate_limit_info as Record<string, unknown> | undefined;
+        if (info?.status === "rejected" && typeof info.resetsAt === "number") {
+          this.rateLimitResetAt = info.resetsAt * 1000;
+        }
+        break;
+      }
       case "system":
         if (msg.subtype === "model_refusal_no_fallback") {
           // A refusal is a normal 200 response with stop_reason "refusal".
@@ -112,7 +138,9 @@ export class MessageAssembler {
       this.sawMessageStop = false;
       const message = (event.message ?? {}) as Record<string, unknown>;
       if (typeof message.id === "string") this.id = message.id;
-      this.usage = { input_tokens: 0, output_tokens: 0, ...usageOf(message.usage) };
+      this.sawMessageStart = true;
+      this.usage = { input_tokens: 0, output_tokens: 0 };
+      this.usage = mergeUsage(this.usage, message.usage);
       this.emit({
         type: "message_start",
         message: {
@@ -174,7 +202,7 @@ export class MessageAssembler {
       if (delta.stop_sequence !== undefined) {
         this.stopSequence = (delta.stop_sequence as string) ?? null;
       }
-      this.usage = { ...this.usage, ...usageOf(event.usage) };
+      this.usage = mergeUsage(this.usage, event.usage);
       this.emit(event);
       return;
     }
@@ -267,12 +295,13 @@ export class MessageAssembler {
     if (typeof message.id === "string" && !this.sawStreamEvents) this.id = message.id;
     if (Array.isArray(message.usage)) return;
     if (message.usage && typeof message.usage === "object") {
-      this.usage = { ...this.usage, ...usageOf(message.usage) };
+      this.usage = mergeUsage(this.usage, message.usage);
     }
     if (typeof message.stop_reason === "string") {
       this.stopReason = normalizeStopReason(message.stop_reason);
     }
     if (typeof msg.error === "string") {
+      this.assistantError = msg.error;
       this.resultError = { type: msg.error, message: `Claude returned ${msg.error}` };
     }
     if (this.sawStreamEvents) return;
@@ -298,17 +327,31 @@ export class MessageAssembler {
   }
 
   private handleResult(msg: Record<string, unknown>): void {
-    if (msg.usage) this.usage = { ...this.usage, ...usageOf(msg.usage) };
+    // A result's usage sums the whole turn. Per-message usage from message_start
+    // and message_delta is the response's own usage; only fall back to the
+    // result when no streamed message was seen.
+    if (msg.usage && !this.sawMessageStart) {
+      this.usage = mergeUsage(this.usage, msg.usage);
+    }
     if (typeof msg.stop_reason === "string") {
       this.stopReason = normalizeStopReason(msg.stop_reason);
     }
-    if (msg.is_error === true || msg.subtype !== "success") {
+    if (typeof msg.api_error_status === "number" && msg.api_error_status >= 400) {
+      this.apiErrorStatus = msg.api_error_status;
+    }
+    if (msg.is_error === true || msg.subtype !== "success" || this.apiErrorStatus !== undefined) {
       const errors = Array.isArray(msg.errors) ? msg.errors.join("; ") : "";
       const message =
-        errors || String(msg.result ?? this.resultError?.message ?? "Claude failed to complete the turn");
+        errors ||
+        String(msg.result ?? this.resultError?.message ?? "Claude failed to complete the turn");
       this.resultError = {
-        type: this.resultError?.type ?? String(msg.subtype ?? "error_during_execution"),
+        type:
+          this.resultError?.type ??
+          this.assistantError ??
+          String(msg.subtype ?? "error_during_execution"),
         message,
+        ...(this.apiErrorStatus !== undefined ? { status: this.apiErrorStatus } : {}),
+        ...(this.rateLimitResetAt !== undefined ? { resetAt: this.rateLimitResetAt } : {}),
       };
     }
   }
