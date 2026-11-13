@@ -39,7 +39,14 @@ import {
 import { TurnInput } from "./turn-input.js";
 import { KeyedLock } from "./keyed-lock.js";
 import { LiveProcess, type QueryHandle } from "./process.js";
-import { ApiError, ClientAbort, ResumeFailed, errorFor, isMissingSession } from "./errors.js";
+import {
+  ApiError,
+  ClientAbort,
+  ResumeFailed,
+  errorFor,
+  isMissingSession,
+  isMissingTranscript,
+} from "./errors.js";
 import { launchKey, queryOptions, stableStringify, wantsThinking } from "./options.js";
 import type { ResumeDecision } from "../session/store.js";
 
@@ -258,13 +265,14 @@ export class ClaudeRunner {
       resumeSessionId = decision.sessionId;
       resumeFromIndex = decision.fromIndex;
     } else if (decision.kind === "fork") {
-      const forkedId = await this.fork(decision);
-      if (forkedId) {
-        resumeSessionId = forkedId;
+      const fork = await this.fork(decision);
+      if (fork.sessionId) {
+        resumeSessionId = fork.sessionId;
         resumeFromIndex = decision.fromIndex;
         forked = true;
       } else {
-        input.forget?.(decision.sessionId);
+        // Any other failure (a full disk, say) leaves the source usable.
+        if (fork.missing) input.forget?.(decision.sessionId);
         decision = { kind: "fresh" };
       }
     }
@@ -290,6 +298,8 @@ export class ClaudeRunner {
     try {
       if (live) {
         if (input.signal.aborted) throw new ClientAbort();
+        // The process now serves this conversation.
+        live.key = input.conversationKey;
         live.begin();
         live.pending.beginPhase();
         live.input.push({ ...prepared.prompt, uuid: randomUUID() } as SDKUserMessage);
@@ -328,7 +338,7 @@ export class ClaudeRunner {
    */
   private async fork(
     decision: Extract<ResumeDecision, { kind: "fork" }>,
-  ): Promise<string | undefined> {
+  ): Promise<{ sessionId?: string; missing?: boolean }> {
     try {
       const result = await this.forkFn(decision.sessionId, {
         upToMessageId: decision.upToMessageId,
@@ -339,14 +349,14 @@ export class ClaudeRunner {
         forkedSessionId: result.sessionId,
         upToMessageId: decision.upToMessageId,
       });
-      return result.sessionId;
+      return { sessionId: result.sessionId };
     } catch (error) {
       this.logger.warn("could not fork Claude session; replaying history", {
         sessionId: decision.sessionId,
         upToMessageId: decision.upToMessageId,
         error: errorMessage(error),
       });
-      return undefined;
+      return { missing: isMissingTranscript(error) };
     }
   }
 
