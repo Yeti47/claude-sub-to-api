@@ -166,7 +166,7 @@ test("reuses one live process for consecutive turns", async () => {
     stream: false,
     plan: () => {
       planned += 1;
-      return { kind: "resume", sessionId: "session-1", fromIndex: 2, matchedUsers: 1 };
+      return { kind: "resume", sessionId: "session-1", fromIndex: 2 };
     },
     record: () => {
       recorded += 1;
@@ -283,7 +283,6 @@ test("forks at a checkpoint and resumes the forked session", async () => {
       sessionId: "session-1",
       upToMessageId: "leaf-1",
       fromIndex: 2,
-      matchedUsers: 1,
     }),
     record: (value, decision) => {
       recorded = { result: value, decision };
@@ -330,7 +329,6 @@ test("replays history in a fresh session when forking fails", async () => {
       sessionId: "session-1",
       upToMessageId: "leaf-1",
       fromIndex: 2,
-      matchedUsers: 1,
     }),
     record: (_result, value) => {
       decision = value;
@@ -370,7 +368,7 @@ test("does not fork when the plan resumes", async () => {
     signal: new AbortController().signal,
     requestId: "resume-only",
     stream: false,
-    plan: () => ({ kind: "resume", sessionId: "session-1", fromIndex: 2, matchedUsers: 1 }),
+    plan: () => ({ kind: "resume", sessionId: "session-1", fromIndex: 2 }),
   });
 
   assert.equal(forks, 0);
@@ -409,7 +407,7 @@ test("replays history when a resumed session no longer exists", async () => {
     signal: new AbortController().signal,
     requestId: "missing-session",
     stream: false,
-    plan: () => ({ kind: "resume", sessionId: "session-1", fromIndex: 0, matchedUsers: 0 }),
+    plan: () => ({ kind: "resume", sessionId: "session-1", fromIndex: 0 }),
   });
 
   assert.equal(calls, 2);
@@ -716,4 +714,86 @@ test("turns an SDK rate-limit result into a 429", async () => {
       }),
     (error: unknown) => error instanceof ApiError && error.status === 429,
   );
+});
+
+test("a request with another configuration leaves the conversation's process alive", async () => {
+  const received: string[] = [];
+  const counter = { calls: 0 };
+  const runner = new ClaudeRunner(
+    { ...config, maxConcurrency: 2, sessionIdleMs: 60_000 },
+    createLogger("error"),
+    persistentQuery(received, counter) as never,
+  );
+  const run = (requestId: string, request: Record<string, unknown>, plan?: () => ResumeDecision) =>
+    runner.run({
+      conversationKey: "conv",
+      request: { model: "claude-sonnet-5-5", ...request } as never,
+      signal: new AbortController().signal,
+      requestId,
+      stream: false,
+      plan,
+    });
+
+  await run("main-1", { messages: [{ role: "user", content: "one" }] });
+  // Same conversation key, different system prompt: a title request.
+  await run("title", { system: "Write a title.", messages: [{ role: "user", content: "one" }] });
+  const second = await run(
+    "main-2",
+    {
+      messages: [
+        { role: "user", content: "one" },
+        { role: "assistant", content: "reply-1" },
+        { role: "user", content: "two" },
+      ],
+    },
+    () => ({ kind: "resume", sessionId: "session-1", fromIndex: 2 }),
+  );
+
+  assert.equal(counter.calls, 2);
+  assert.equal(second.reused, true);
+  assert.deepEqual(received, ["one", "one", "two"]);
+  runner.closeAll();
+});
+
+test("releases a claimed session when its turn fails, and forgets a missing one", async () => {
+  const released: ResumeDecision[] = [];
+  const decision: ResumeDecision = { kind: "resume", sessionId: "session-1", fromIndex: 0 };
+  const failing = new ClaudeRunner(
+    config,
+    createLogger("error"),
+    fakeQuery([
+      { type: "result", subtype: "error_during_execution", is_error: true, errors: ["rate_limit"], stop_reason: null, usage: {} },
+    ]) as never,
+  );
+  await assert.rejects(() =>
+    failing.run({
+      conversationKey: "conv",
+      request: { model: "m", messages: [{ role: "user", content: "hi" }] },
+      signal: new AbortController().signal,
+      requestId: "release",
+      stream: false,
+      plan: () => decision,
+      release: (value) => released.push(value),
+    }),
+  );
+  assert.deepEqual(released, [decision]);
+
+  const forgotten: string[] = [];
+  const forking = new ClaudeRunner(
+    config,
+    createLogger("error"),
+    fakeQuery(textEvents) as never,
+    undefined,
+    (() => Promise.reject(new Error("transcript missing"))) as never,
+  );
+  await forking.run({
+    conversationKey: "conv",
+    request: { model: "m", messages: [{ role: "user", content: "hi" }] },
+    signal: new AbortController().signal,
+    requestId: "forget",
+    stream: false,
+    plan: () => ({ kind: "fork", sessionId: "gone", upToMessageId: "leaf", fromIndex: 0 }),
+    forget: (sessionId) => forgotten.push(sessionId),
+  });
+  assert.deepEqual(forgotten, ["gone"]);
 });

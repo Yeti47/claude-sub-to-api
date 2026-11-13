@@ -127,38 +127,44 @@ export function createHandler(deps: Deps) {
     let writer: SseWriter | undefined;
     if (stream) writer = new SseWriter(res);
 
-    const key = deriveConversationKey(
-      request.messages,
-      sessionHeader(req),
-      request.metadata?.user_id,
-    );
-    const promptHash = systemHash(systemText(request.system) ?? null);
-    const plan = () =>
-      deps.sessions.plan({
-        key,
+    const scope = {
+      model: request.model,
+      cwd: config.cwd,
+      systemHash: systemHash(systemText(request.system) ?? null),
+    };
+    // Requests of one conversation run in order. A side request that shares
+    // the client's session id but uses another model or system prompt (title
+    // generation, a subagent) is a conversation of its own: it must not wait
+    // for the main one, or close its parked tool turn.
+    const key = JSON.stringify([
+      deriveConversationKey(request.messages, sessionHeader(req), request.metadata?.user_id),
+      scope.model,
+      scope.systemHash,
+    ]);
+    const plan = () => {
+      const decision = deps.sessions.plan({
+        ...scope,
         messages: request.messages,
-        model: request.model,
-        cwd: config.cwd,
-        systemHash: promptHash,
         now: Date.now(),
       });
-    const record = (result: RunResult, decision?: ResumeDecision) => {
+      deps.sessions.claim(decision);
+      return decision;
+    };
+    const record = (result: RunResult) => {
       if (!result.sessionId) return;
       deps.sessions.record({
-        key,
+        ...scope,
         sessionId: result.sessionId,
-        model: request.model,
-        cwd: config.cwd,
-        systemHash: promptHash,
         history: [
           ...request.messages,
           { role: "assistant", content: result.response.content },
         ],
         leafUuid: result.leafUuid,
         parked: Boolean(result.parked),
-        decision,
       });
     };
+    const release = (decision: ResumeDecision) => deps.sessions.release(decision);
+    const forget = (sessionId: string) => deps.sessions.forget(sessionId);
 
     try {
       const toolResults = lastToolResults(request.messages);
@@ -219,6 +225,8 @@ export function createHandler(deps: Deps) {
           persistSession: true,
           plan,
           record,
+          release,
+          forget,
         });
         if (result.parked) deps.parked.add(key, result.parked);
       }
