@@ -333,6 +333,10 @@ export class ClaudeRunner {
     launchKey: string,
   ): Promise<RunResult> {
     const release = await this.acquireSlot(input.signal);
+    if (input.signal.aborted) {
+      release();
+      throw new ClientAbort();
+    }
     let state: TurnState | undefined;
     try {
       const pending = this.createPending();
