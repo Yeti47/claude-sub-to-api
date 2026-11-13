@@ -22,7 +22,7 @@ Anthropic
 - `POST /v1/messages` turns the Messages API request into one Agent SDK turn. Claude runs with its normal Claude Code harness prompt; the client's system prompt is appended as turn instructions and takes precedence for that request. Built-in tools are disabled, and project settings/skills/MCP servers are not loaded.
 - The model is told plainly that it runs in `claude-sub-to-api` through the Claude Code harness, and that the tools come from the API client. Nothing pretends to be the Anthropic API or hides the harness.
 - Prompts are delivered verbatim: Claude Code does not expand `@path` mentions, run slash commands, or inject its own per-turn context. Auto-compaction, CLAUDE.md discovery, user hooks, tool search, the advisor tool, away summaries, and the non-streaming/refusal fallbacks are disabled, so the response is shaped only by this proxy and the API client.
-- Each conversation is bound to a persisted Claude session when possible. Resuming it, together with `excludeDynamicSections`, keeps the harness prompt stable and produced real prompt-cache reads in testing.
+- Each conversation is bound to a persisted Claude session. A live conversation keeps one Claude Code process alive between turns; it closes after `SESSION_IDLE_MS` idle and the next message resumes the saved session. Resuming it, together with `excludeDynamicSections`, keeps the harness prompt stable and produced real prompt-cache reads in testing.
 - Conversation history is resumed from the bound Claude session when possible; otherwise it is replayed as a transcript. The final user turn, including images and documents, is passed through natively.
 - Client-defined `tools` are exposed to Claude as an in-process MCP server. When Claude calls one, the server returns a normal `tool_use` block and stops the turn. The client executes the tool and sends a follow-up request containing `tool_result`.
 - `GET /v1/models` asks the signed-in CLI which models the account can use.
@@ -131,6 +131,8 @@ One consequence is that the harness prompt is coding-oriented and the CLI attach
 
 Every request carries a conversation key: the `x-session-id`, `x-bf-session-id` or `x-claude-session-id` header, the `metadata.user_id.session_id` field, or finally a hash of the first user message. The server persists a binding from that key to the Claude Code session id in `STATE_PATH` (default `<claude config dir>/sub-to-api-sessions.json`).
 
+While a conversation is live, the proxy keeps one Claude process and pushes each new turn into its input stream. The process is closed after `SESSION_IDLE_MS` (5 minutes) of idle; the next request starts a new process and resumes the saved session. A request that changes the model, system prompt or tools, or rewrites history, restarts the process and falls back to the transcript path.
+
 When the next request's user turns extend the bound history, the proxy resumes the same Claude session and sends only the new turn instead of replaying a reconstructed transcript. A changed model, system prompt, shortened/edited history, or a retry with no new user turn starts a fresh session and falls back to the transcript path. Tool-result turns are handled by the parked-tool bridge below.
 
 This is the same mechanism [opencode-claude](https://github.com/openchamber/opencode-claude) uses. With the stable harness prompt (`excludeDynamicSections: true`) and resume, a live two-turn Haiku test showed real cache reuse:
@@ -160,12 +162,13 @@ All configuration is environment-based.
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Writable directory for the CLI's `.claude.json`, session transcripts, and state. `/data` in Docker. |
 | `LISTEN_ADDR` | `:8080` | Bind address. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
-| `MAX_CONCURRENCY` | `4` | Maximum simultaneous Claude Code processes. |
+| `MAX_CONCURRENCY` | `4` | Maximum simultaneous live Claude Code processes. |
 | `REQUEST_TIMEOUT_MS` | `900000` | Per-request upper bound. |
 | `DEFAULT_MAX_TOKENS` | `8192` | Output ceiling when `max_tokens` is omitted (the Messages API requires it). |
 | `CLAUDE_CWD` | process cwd | Working directory for the CLI. Use a neutral empty directory for an API-only setup; it keeps repository context out of the prompt. |
 | `STATE_PATH` | `<claude config dir>/sub-to-api-sessions.json` | Persisted conversation → Claude session bindings. |
 | `PARKED_TURN_TTL_MS` | `1800000` | How long a tool turn waits for `tool_result` before its process is closed (`0` disables). |
+| `SESSION_IDLE_MS` | `300000` | How long an idle conversation keeps its Claude process alive (`0` closes it immediately). |
 | `CLAUDE_CODE_MAX_RETRIES` | `0` | CLI API retries. Keep `0` so one API request maps to one model response; clients own retries. |
 
 ## Limitations
@@ -177,7 +180,7 @@ All configuration is environment-based.
 - Images and documents are passed through as native content blocks. An unprocessable attachment becomes a `400 invalid_request_error`.
 - `metadata` is used only to derive a conversation key; it is not forwarded.
 - The CLI attaches its own environment/account context (working directory, plan tokens, email) to the prompt. `CLAUDE_CWD` controls the directory it sees.
-- One Claude Code process is started per request. The first token latency includes process startup; memory use is roughly a few hundred MB per concurrent request.
+- One Claude Code process per active conversation, kept for `SESSION_IDLE_MS` (5 minutes) after a turn. `MAX_CONCURRENCY` caps live processes; a new conversation evicts the least-recently-used idle process, or waits when every process is busy or parked. Memory is roughly a few hundred MB per live process.
 
 ## Secret scanning
 
