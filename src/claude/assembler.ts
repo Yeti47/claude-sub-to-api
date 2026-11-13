@@ -64,6 +64,8 @@ export class MessageAssembler {
   sawStreamEvents = false;
   sawMessageStart = false;
   sessionId?: string;
+  /** Transcript UUID of the last main-chain assistant message. */
+  leafUuid?: string;
   resultError: { type: string; message: string; status?: number; resetAt?: number } | null = null;
   /** A CLI-level notice (not model output) that must fail the request. */
   fatalError = false;
@@ -96,6 +98,11 @@ export class MessageAssembler {
         this.handleStreamEvent(msg.event as Record<string, unknown>);
         break;
       case "assistant":
+        // Main-chain assistant messages are the entries a session fork can
+        // slice at; subagent messages (parent_tool_use_id set) are not.
+        if (typeof msg.parent_tool_use_id !== "string" && typeof msg.uuid === "string") {
+          this.leafUuid = msg.uuid;
+        }
         this.handleAssistant(msg);
         break;
       case "result":

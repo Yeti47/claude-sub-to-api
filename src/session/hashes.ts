@@ -6,6 +6,9 @@ function sha1(value: string): string {
   return createHash("sha1").update(value).digest("hex");
 }
 
+/** Starting value of the rolling history fingerprint. */
+const HISTORY_SEED = sha1("claude-sub-to-api:history");
+
 function hashContent(content: Message["content"]): string {
   if (typeof content === "string") return sha1(`text:${content}`);
   if (!Array.isArray(content)) return sha1(JSON.stringify(content ?? null));
@@ -41,6 +44,57 @@ export function userMessageHashes(messages: Message[]): string[] {
   return (messages ?? [])
     .filter((message) => message?.role === "user")
     .map((message) => hashContent(message.content));
+}
+
+/**
+ * Hash one message's content for a complete-history fingerprint. Unlike the
+ * user-message hashes, thinking blocks are ignored: clients may drop them,
+ * they are not replayed into the model's transcript, and they are not part of
+ * the visible reply. Strings and single text blocks are normalized so the
+ * same content fingerprints identically either way.
+ */
+function historyContentHash(content: Message["content"]): string {
+  const blocks: ContentBlock[] =
+    typeof content === "string"
+      ? [{ type: "text", text: content }]
+      : Array.isArray(content)
+        ? (content as ContentBlock[])
+        : [];
+  const parts = blocks
+    .map((block) =>
+      block.type === "thinking" || block.type === "redacted_thinking"
+        ? ""
+        : hashBlock(block),
+    )
+    .filter((part) => part.length > 0);
+  return sha1(parts.join("\u0000"));
+}
+
+/**
+ * Rolling fingerprint of each message-history prefix. Index i is the
+ * fingerprint through message i, so a checkpoint ending before message index
+ * `boundary` compares against `hashes[boundary - 1]`.
+ */
+export function historyPrefixHashes(messages: Message[]): string[] {
+  const hashes: string[] = [];
+  let hash = HISTORY_SEED;
+  for (const message of messages ?? []) {
+    hash = sha1(`${hash}\u0000${message.role}:${historyContentHash(message.content)}`);
+    hashes.push(hash);
+  }
+  return hashes;
+}
+
+/**
+ * Fingerprint of a complete message history, including assistant replies.
+ *
+ * Checkpoints use this instead of user-message hashes alone so an edit to an
+ * earlier assistant reply is detected: resuming or forking at a checkpoint
+ * whose transcript contains the original reply would give Claude history the
+ * client did not send.
+ */
+export function historyFingerprint(messages: Message[]): string {
+  return historyPrefixHashes(messages).at(-1) ?? HISTORY_SEED;
 }
 
 /** Hash the system prompt, so a changed prompt starts a fresh session. */

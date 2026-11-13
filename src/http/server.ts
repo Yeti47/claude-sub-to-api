@@ -8,9 +8,9 @@ import type { Message, MessagesRequest, ToolResultBlock } from "../anthropic/typ
 import { contentBlocks, systemText } from "../anthropic/translate.js";
 import { ApiError, ClientAbort, ClaudeRunner, type RunResult } from "../claude/runner.js";
 import type { ModelCatalog } from "../claude/models.js";
-import type { SessionStore } from "../session/store.js";
+import type { SessionStore, ResumeDecision } from "../session/store.js";
 import type { ParkedTurnStore } from "../claude/parked.js";
-import { deriveConversationKey, systemHash, userMessageHashes } from "../session/hashes.js";
+import { deriveConversationKey, systemHash } from "../session/hashes.js";
 import { SseWriter } from "./sse.js";
 
 const MAX_BODY = 32 << 20;
@@ -132,7 +132,6 @@ export function createHandler(deps: Deps) {
       sessionHeader(req),
       request.metadata?.user_id,
     );
-    const hashes = userMessageHashes(request.messages);
     const promptHash = systemHash(systemText(request.system) ?? null);
     const plan = () =>
       deps.sessions.plan({
@@ -143,7 +142,7 @@ export function createHandler(deps: Deps) {
         systemHash: promptHash,
         now: Date.now(),
       });
-    const record = (result: RunResult) => {
+    const record = (result: RunResult, decision?: ResumeDecision) => {
       if (!result.sessionId) return;
       deps.sessions.record({
         key,
@@ -151,7 +150,13 @@ export function createHandler(deps: Deps) {
         model: request.model,
         cwd: config.cwd,
         systemHash: promptHash,
-        userHashes: hashes,
+        history: [
+          ...request.messages,
+          { role: "assistant", content: result.response.content },
+        ],
+        leafUuid: result.leafUuid,
+        parked: Boolean(result.parked),
+        decision,
       });
     };
 
@@ -231,6 +236,7 @@ export function createHandler(deps: Deps) {
         stream,
         status: 200,
         resumed: Boolean(result.resumed),
+        forked: Boolean(result.forked),
         reused: Boolean(result.reused),
         parked: Boolean(result.parked),
         sessionId: result.sessionId,

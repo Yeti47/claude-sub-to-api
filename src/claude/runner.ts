@@ -1,6 +1,11 @@
 /** Runs one Messages API turn through the Claude Agent SDK. */
 import { randomUUID } from "node:crypto";
-import { query as sdkQuery, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import {
+  forkSession as sdkForkSession,
+  query as sdkQuery,
+  type SDKMessage,
+  type SDKUserMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 import type { Config } from "../config.js";
 import { errorMessage, type Logger } from "../logger.js";
 import type {
@@ -22,6 +27,7 @@ import {
 import { ParkedTurn, type ResumeParkedInput } from "./parked.js";
 import { TurnInput } from "./turn-input.js";
 import { KeyedLock } from "./keyed-lock.js";
+import type { ResumeDecision } from "../session/store.js";
 
 export class ApiError extends Error {
   constructor(readonly status: number, readonly type: string, message: string) {
@@ -65,10 +71,14 @@ export interface RunInput {
   resumeFromIndex?: number;
   /** Persist the CLI transcript so a later request can resume it. */
   persistSession?: boolean;
-  /** Recompute the resume plan inside the conversation lock. */
-  plan?: () => { sessionId: string; fromIndex: number } | null;
-  /** Persist the session binding before the conversation lock is released. */
-  record?: (result: RunResult) => void;
+  /** Recompute the resume/fork decision inside the conversation lock. */
+  plan?: () => ResumeDecision;
+  /**
+   * Persist the session binding before the conversation lock is released.
+   * `decision` is the plan that started the turn, or undefined for a parked
+   * tool continuation.
+   */
+  record?: (result: RunResult, decision?: ResumeDecision) => void;
 }
 
 export interface RunResult {
@@ -76,11 +86,21 @@ export interface RunResult {
   sessionId?: string;
   /** Set when the turn stopped on a tool call and waits for client results. */
   parked?: ParkedTurn;
+  /** Transcript UUID of the final main-chain assistant message. */
+  leafUuid?: string;
   /** Whether this turn reused an already-running Claude process. */
   reused?: boolean;
   /** Whether this turn started a new process from a resumed session. */
   resumed?: boolean;
+  /** Whether this turn resumed a session forked from an earlier checkpoint. */
+  forked?: boolean;
 }
+
+/** The SDK's session-fork operation, injectable for tests. */
+export type ForkSession = (
+  sessionId: string,
+  options?: { upToMessageId?: string; dir?: string },
+) => Promise<{ sessionId: string }>;
 
 interface TurnState {
   key: string;
@@ -200,6 +220,7 @@ export class ClaudeRunner {
     private readonly logger: Logger,
     private readonly queryFn: QueryFactory = sdkQuery as unknown as QueryFactory,
     private readonly createPending: () => PendingToolRegistry = () => new PendingToolRegistry(),
+    private readonly forkFn: ForkSession = sdkForkSession,
   ) {
     this.limit = new Semaphore(config.maxConcurrency);
   }
@@ -264,12 +285,44 @@ export class ClaudeRunner {
     if (input.signal.aborted) throw new ClientAbort();
     // Planning happens under the conversation lock, so a concurrent request
     // cannot reuse a plan computed against an older committed history.
-    const plan = input.plan ? input.plan() : null;
-    const resumeSessionId = plan?.sessionId ?? input.resumeSessionId;
-    const resumeFromIndex = plan?.fromIndex ?? input.resumeFromIndex;
+    let decision: ResumeDecision = input.plan
+      ? input.plan()
+      : input.resumeSessionId !== undefined && input.resumeFromIndex !== undefined
+        ? {
+            kind: "resume",
+            sessionId: input.resumeSessionId,
+            fromIndex: input.resumeFromIndex,
+            matchedUsers: 0,
+          }
+        : { kind: "fresh" };
+
+    let state = this.processes.get(input.conversationKey);
+    // A fork reads a transcript that this conversation's live process owns.
+    // Close it first so the CLI is not still appending to the file.
+    if (decision.kind === "fork" && state) {
+      this.closeState(state, "Forking the conversation history");
+      state = undefined;
+    }
+
+    let resumeSessionId: string | undefined;
+    let resumeFromIndex: number | undefined;
+    let forked = false;
+    if (decision.kind === "resume") {
+      resumeSessionId = decision.sessionId;
+      resumeFromIndex = decision.fromIndex;
+    } else if (decision.kind === "fork") {
+      const forkedId = await this.fork(decision);
+      if (forkedId) {
+        resumeSessionId = forkedId;
+        resumeFromIndex = decision.fromIndex;
+        forked = true;
+      } else {
+        decision = { kind: "fresh" };
+      }
+    }
+
     let prepared = prepareTurn(input.request, { resumeFromIndex });
     let launchKey = this.launchKey(input.request, prepared);
-    let state = this.processes.get(input.conversationKey);
 
     if (state) {
       const sameSession =
@@ -295,8 +348,8 @@ export class ClaudeRunner {
         state.pending.beginPhase();
         state.input.push({ ...prepared.prompt, uuid: randomUUID() } as SDKUserMessage);
         const result = await this.consume(state, { ...input, resumeSessionId: undefined });
-        const finished = { ...result, reused: true };
-        input.record?.(finished);
+        const finished = { ...result, reused: true, forked };
+        input.record?.(finished, decision);
         return finished;
       }
       const result = await this.startProcess(
@@ -305,7 +358,8 @@ export class ClaudeRunner {
         launchKey,
       );
       if (resumeSessionId !== undefined) result.resumed = true;
-      input.record?.(result);
+      if (forked) result.forked = true;
+      input.record?.(result, decision);
       return result;
     } catch (error) {
       if (error instanceof ResumeFailed) {
@@ -321,10 +375,39 @@ export class ClaudeRunner {
         prepared = prepareTurn(input.request);
         launchKey = this.launchKey(input.request, prepared);
         const result = await this.startProcess(fresh, prepared, launchKey);
-        input.record?.(result);
+        input.record?.(result, { kind: "fresh" });
         return result;
       }
       throw error;
+    }
+  }
+
+  /**
+   * Fork the session at a checkpoint. A missing or unreadable transcript must
+   * not fail the request: the caller replays the history into a fresh session
+   * instead.
+   */
+  private async fork(
+    decision: Extract<ResumeDecision, { kind: "fork" }>,
+  ): Promise<string | undefined> {
+    try {
+      const result = await this.forkFn(decision.sessionId, {
+        upToMessageId: decision.upToMessageId,
+        dir: this.config.cwd,
+      });
+      this.logger.debug("forked Claude session at checkpoint", {
+        sessionId: decision.sessionId,
+        forkedSessionId: result.sessionId,
+        upToMessageId: decision.upToMessageId,
+      });
+      return result.sessionId;
+    } catch (error) {
+      this.logger.warn("could not fork Claude session; replaying history", {
+        sessionId: decision.sessionId,
+        upToMessageId: decision.upToMessageId,
+        error: errorMessage(error),
+      });
+      return undefined;
     }
   }
 
@@ -561,7 +644,12 @@ export class ClaudeRunner {
             throw new ApiError(502, "api_error", "Claude requested a tool the bridge could not match");
           }
           state.busy = true;
-          return { response, sessionId: state.sessionId, parked: this.makeParked(state) };
+          return {
+            response,
+            sessionId: state.sessionId,
+            leafUuid: assembler.leafUuid,
+            parked: this.makeParked(state),
+          };
         }
         if (lastMessage.type === "result") break;
       }
@@ -587,11 +675,11 @@ export class ClaudeRunner {
 
     if (assembler.fatalError && assembler.resultError) {
       this.closeState(state, "Turn failed");
-      throw errorFor(assembler.resultError);
+      throw this.resultFailure(assembler, input);
     }
     if (assembler.resultError && assembler.content.length === 0) {
       this.closeState(state, "Turn failed");
-      throw errorFor(assembler.resultError);
+      throw this.resultFailure(assembler, input);
     }
     if (assembler.content.length === 0 && typeof lastMessage?.result === "string") {
       assembler.content = [{ type: "text", text: lastMessage.result }];
@@ -610,7 +698,28 @@ export class ClaudeRunner {
     else if (this.limit.waiting > 0) {
       this.closeState(state, "Yielded capacity to a waiting conversation");
     } else this.armIdle(state);
-    return { response, sessionId: state.sessionId };
+    return {
+      response,
+      sessionId: state.sessionId,
+      leafUuid: assembler.leafUuid,
+    };
+  }
+
+  /**
+   * Convert a completed result error into the API error to throw. A missing
+   * session on a resume is retryable by replaying the transcript, so it is
+   * surfaced as ResumeFailed instead of a 502.
+   */
+  private resultFailure(assembler: MessageAssembler, input: RunInput): Error {
+    const error = assembler.resultError!;
+    if (
+      input.resumeSessionId &&
+      !assembler.sawStreamEvents &&
+      isMissingSession(error.message)
+    ) {
+      return new ResumeFailed(error.message);
+    }
+    return errorFor(error);
   }
 
   private makeParked(state: TurnState): ParkedTurn {
