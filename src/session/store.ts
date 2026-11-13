@@ -83,8 +83,12 @@ function indexKey(scope: SessionScope, historyHash: string): string {
 
 export class SessionStore {
   private sessions = new Map<string, SessionEntry>();
-  /** Scope and history fingerprint -> the session holding that checkpoint. */
-  private index = new Map<string, string>();
+  /**
+   * Scope and history fingerprint -> the sessions holding that checkpoint,
+   * most recently recorded last. Several sessions can hold the same history
+   * (a fork and its source, a replay), so dropping one must not hide the rest.
+   */
+  private index = new Map<string, string[]>();
   /** Bumped on every change; `written` is the revision last put on disk. */
   private revision = 0;
   private written = 0;
@@ -117,9 +121,7 @@ export class SessionStore {
       for (const [sessionId, entry] of sessions) {
         if (!validEntry(entry)) continue;
         this.sessions.set(sessionId, entry);
-        for (const checkpoint of entry.checkpoints) {
-          this.index.set(indexKey(entry, checkpoint.historyHash), sessionId);
-        }
+        for (const checkpoint of entry.checkpoints) this.addToIndex(sessionId, entry, checkpoint);
       }
     } catch {
       this.logger.warn("could not read session state", { path: this.path });
@@ -220,7 +222,7 @@ export class SessionStore {
     for (let count = userIndices.length - 1; count >= 1; count -= 1) {
       const fromIndex = userIndices[count]!;
       const historyHash = prefixHashes[fromIndex - 1]!;
-      const sessionId = this.index.get(indexKey(input, historyHash));
+      const sessionId = this.index.get(indexKey(input, historyHash))?.at(-1);
       if (!sessionId) continue;
       const session = this.sessions.get(sessionId);
       const checkpoint = session?.checkpoints.find((item) => item.historyHash === historyHash);
@@ -259,7 +261,8 @@ export class SessionStore {
     session.updatedAt = Date.now();
     if (decision.kind === "resume") {
       session.tip = "";
-      // Persisted, so a turn that fails still forks after a restart.
+      // Persisted shortly after, so a turn that dies mid-way still forks after
+      // a restart instead of resuming a transcript with a partial exchange.
       this.save();
     }
   }
@@ -321,7 +324,7 @@ export class SessionStore {
       while (session.checkpoints.length > MAX_CHECKPOINTS) {
         this.unindex(input.sessionId, session, session.checkpoints.shift()!);
       }
-      this.index.set(indexKey(session, checkpoint.historyHash), input.sessionId);
+      this.addToIndex(input.sessionId, session, checkpoint);
       session.tip = checkpoint.historyHash;
     }
     session.updatedAt = Date.now();
@@ -339,10 +342,18 @@ export class SessionStore {
     if (save) this.save();
   }
 
+  private addToIndex(sessionId: string, session: SessionEntry, checkpoint: Checkpoint): void {
+    const key = indexKey(session, checkpoint.historyHash);
+    const owners = (this.index.get(key) ?? []).filter((id) => id !== sessionId);
+    owners.push(sessionId);
+    this.index.set(key, owners);
+  }
+
   private unindex(sessionId: string, session: SessionEntry, checkpoint: Checkpoint): void {
     const key = indexKey(session, checkpoint.historyHash);
-    // A newer session may hold the same history; leave its entry alone.
-    if (this.index.get(key) === sessionId) this.index.delete(key);
+    const owners = (this.index.get(key) ?? []).filter((id) => id !== sessionId);
+    if (owners.length > 0) this.index.set(key, owners);
+    else this.index.delete(key);
   }
 
   private prune(): void {

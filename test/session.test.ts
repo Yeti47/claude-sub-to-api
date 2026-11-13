@@ -282,6 +282,21 @@ test("keeps recording checkpoints in a long conversation", () => {
   });
 });
 
+test("forgetting one of two sessions with the same history keeps the other", () => {
+  const sessions = store();
+  const first = [u("one"), a("reply")];
+  record(sessions, first, "s1", "leaf-1");
+  record(sessions, first, "s2", "leaf-2");
+
+  sessions.forget("s2");
+  const decision = plan(sessions, [...first, u("two")]);
+  assert.equal(decision.kind, "resume");
+  if (decision.kind === "resume") assert.equal(decision.sessionId, "s1");
+
+  sessions.forget("s1");
+  assert.deepEqual(plan(sessions, [...first, u("two")]), { kind: "fresh" });
+});
+
 test("a forgotten session no longer matches", () => {
   const sessions = store();
   const first = [u("one"), a("reply")];
