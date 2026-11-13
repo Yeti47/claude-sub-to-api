@@ -80,8 +80,12 @@ function indexKey(scope: SessionScope, historyHash: string): string {
 
 export class SessionStore {
   private sessions = new Map<string, SessionEntry>();
-  /** Scope and history fingerprint -> the session holding that checkpoint. */
-  private index = new Map<string, string>();
+  /**
+   * Scope and history fingerprint -> the sessions holding that checkpoint,
+   * most recently recorded last. Several sessions can hold the same history
+   * (a fork and its source, a replay), so dropping one must not hide the rest.
+   */
+  private index = new Map<string, string[]>();
 
   constructor(
     private readonly path: string | undefined,
@@ -104,9 +108,7 @@ export class SessionStore {
       for (const [sessionId, entry] of sessions) {
         if (!validEntry(entry)) continue;
         this.sessions.set(sessionId, entry);
-        for (const checkpoint of entry.checkpoints) {
-          this.index.set(indexKey(entry, checkpoint.historyHash), sessionId);
-        }
+        for (const checkpoint of entry.checkpoints) this.addToIndex(sessionId, entry, checkpoint);
       }
     } catch {
       this.logger.warn("could not read session state", { path: this.path });
@@ -150,7 +152,7 @@ export class SessionStore {
     for (let count = userIndices.length - 1; count >= 1; count -= 1) {
       const fromIndex = userIndices[count]!;
       const historyHash = prefixHashes[fromIndex - 1]!;
-      const sessionId = this.index.get(indexKey(input, historyHash));
+      const sessionId = this.index.get(indexKey(input, historyHash))?.at(-1);
       if (!sessionId) continue;
       const session = this.sessions.get(sessionId);
       const checkpoint = session?.checkpoints.find((item) => item.historyHash === historyHash);
@@ -186,7 +188,12 @@ export class SessionStore {
     const session = this.sessions.get(decision.sessionId);
     if (!session) return;
     session.updatedAt = Date.now();
-    if (decision.kind === "resume") session.tip = "";
+    if (decision.kind === "resume") {
+      session.tip = "";
+      // On disk before the turn reaches the CLI: after a crash mid-turn the
+      // transcript must not look like it still ends at this checkpoint.
+      this.save();
+    }
   }
 
   /** Undo a claim whose turn never reached the session. */
@@ -196,6 +203,7 @@ export class SessionStore {
     if (!session || session.tip !== "") return;
     if (session.checkpoints.some((item) => item.historyHash === decision.historyHash)) {
       session.tip = decision.historyHash;
+      this.save();
     }
   }
 
@@ -240,7 +248,7 @@ export class SessionStore {
       while (session.checkpoints.length > MAX_CHECKPOINTS) {
         this.unindex(input.sessionId, session, session.checkpoints.shift()!);
       }
-      this.index.set(indexKey(session, checkpoint.historyHash), input.sessionId);
+      this.addToIndex(input.sessionId, session, checkpoint);
       session.tip = checkpoint.historyHash;
     }
     session.updatedAt = Date.now();
@@ -258,10 +266,18 @@ export class SessionStore {
     if (save) this.save();
   }
 
+  private addToIndex(sessionId: string, session: SessionEntry, checkpoint: Checkpoint): void {
+    const key = indexKey(session, checkpoint.historyHash);
+    const owners = (this.index.get(key) ?? []).filter((id) => id !== sessionId);
+    owners.push(sessionId);
+    this.index.set(key, owners);
+  }
+
   private unindex(sessionId: string, session: SessionEntry, checkpoint: Checkpoint): void {
     const key = indexKey(session, checkpoint.historyHash);
-    // A newer session may hold the same history; leave its entry alone.
-    if (this.index.get(key) === sessionId) this.index.delete(key);
+    const owners = (this.index.get(key) ?? []).filter((id) => id !== sessionId);
+    if (owners.length > 0) this.index.set(key, owners);
+    else this.index.delete(key);
   }
 
   private prune(): void {
