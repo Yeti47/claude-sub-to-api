@@ -276,6 +276,7 @@ export class ClaudeRunner {
         !resumeSessionId || !state.sessionId || state.sessionId === resumeSessionId;
       const compatible =
         !state.closed &&
+        !state.busy &&
         state.launchKey === launchKey &&
         resumeFromIndex !== undefined &&
         sameSession;
