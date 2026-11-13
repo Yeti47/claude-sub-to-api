@@ -207,7 +207,16 @@ export class SessionStore {
         (checkpoint) => checkpoint.count <= decision.matchedUsers,
       );
     } else {
-      checkpoints = [...(existing?.checkpoints ?? [])];
+      checkpoints =
+        existing &&
+        existing.sessionId === input.sessionId &&
+        existing.model === input.model &&
+        existing.cwd === input.cwd &&
+        existing.systemHash === input.systemHash &&
+        existing.userHashes.length <= input.userHashes.length &&
+        existing.userHashes.every((hash, index) => hash === input.userHashes[index])
+          ? [...(existing.checkpoints ?? [])]
+          : [];
     }
 
     if (!input.parked && input.leafUuid && input.userHashes.length > 0) {
