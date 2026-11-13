@@ -160,9 +160,15 @@ export class ClaudeRunner {
     const parked = this.findParked([...toolResults.results.keys()]);
     if (parked) return this.continueParked(parked, input, toolResults);
 
-    // The conversation moved on without answering its tool calls.
+    // The client moved past a tool call without answering it in its final
+    // message, so the turn waiting for that answer is dead. Other parked
+    // turns stay: agents running in parallel may share a conversation key.
+    const called = toolUseIds(input.request.messages);
     for (const process of [...this.processes]) {
-      if (process.key === input.conversationKey && process.status === "parked") {
+      if (
+        process.status === "parked" &&
+        process.pending.pendingIds().some((id) => called.has(id))
+      ) {
         process.close("Superseded by a new request");
       }
     }
@@ -407,18 +413,86 @@ export class ClaudeRunner {
     return this.consume(process, input, launch.resumeSessionId !== undefined);
   }
 
+  /**
+   * Wait for a process slot. While every slot is taken, processes nobody is
+   * actively using are closed to make room; a request that still has no slot
+   * after `queueTimeoutMs` is turned away so the client can back off.
+   */
   private async acquireSlot(signal: AbortSignal): Promise<() => void> {
-    if (this.processes.size >= this.config.maxConcurrency) {
-      const idle = [...this.processes]
-        .filter((process) => process.status === "idle")
-        .sort((a, b) => a.lastUsed - b.lastUsed)[0];
-      if (idle) idle.close("Evicted idle session");
-    }
+    const wait = new AbortController();
+    const onAbort = () => wait.abort();
+    signal.addEventListener("abort", onAbort, { once: true });
+    let timedOut = false;
+    const timeout =
+      this.config.queueTimeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true;
+            wait.abort();
+          }, this.config.queueTimeoutMs)
+        : undefined;
+    timeout?.unref?.();
+    // A parked turn becomes evictable as it ages, so keep looking.
+    let recheck: ReturnType<typeof setTimeout> | undefined;
+    const makeRoom = () => {
+      recheck = setTimeout(makeRoom, this.evict() ? 50 : this.nextEvictionMs());
+      recheck.unref?.();
+    };
+    if (this.processes.size >= this.config.maxConcurrency) makeRoom();
     try {
-      return await this.limit.acquire(signal);
+      const release = await this.limit.acquire(wait.signal);
+      return release;
     } catch {
-      throw new ClientAbort();
+      if (!timedOut || signal.aborted) throw new ClientAbort();
+      throw new ApiError(
+        529,
+        "overloaded_error",
+        `All ${this.config.maxConcurrency} Claude processes are busy. Retry shortly.`,
+        QUEUE_RETRY_AFTER_SECONDS,
+      );
+    } finally {
+      clearTimeout(timeout);
+      clearTimeout(recheck);
+      signal.removeEventListener("abort", onAbort);
     }
+  }
+
+  /**
+   * Close the process that costs least to lose: the least recently used idle
+   * one (its session resumes later), else the parked turn that has waited
+   * longest past its grace period (its tool results are replayed into a fork).
+   */
+  private evict(): boolean {
+    const oldest = (status: LiveProcess["status"]) =>
+      [...this.processes]
+        .filter((process) => process.status === status)
+        .sort((a, b) => a.lastUsed - b.lastUsed)[0];
+    const idle = oldest("idle");
+    if (idle) {
+      idle.close("Evicted idle session");
+      return true;
+    }
+    const grace = this.config.parkedEvictableAfterMs;
+    const parked = oldest("parked");
+    if (grace > 0 && parked && Date.now() - parked.lastUsed >= grace) {
+      this.logger.info("evicted a parked tool turn to free a process slot", {
+        sessionId: parked.sessionId,
+        parkedMs: Date.now() - parked.lastUsed,
+      });
+      parked.close("Evicted parked tool turn");
+      return true;
+    }
+    return false;
+  }
+
+  /** When to look for an evictable process again. */
+  private nextEvictionMs(): number {
+    const grace = this.config.parkedEvictableAfterMs;
+    if (grace <= 0) return 1000;
+    const now = Date.now();
+    const waits = [...this.processes]
+      .filter((process) => process.status === "parked")
+      .map((process) => process.lastUsed + grace - now);
+    return Math.min(1000, Math.max(10, ...(waits.length ? [Math.min(...waits)] : [1000])));
   }
 
   /**
@@ -549,6 +623,21 @@ export class ClaudeRunner {
       leafUuid: assembler.leafUuid,
     };
   }
+}
+
+/** Seconds a client turned away for lack of a free process should wait. */
+const QUEUE_RETRY_AFTER_SECONDS = 10;
+
+/** Every tool call the request's history contains. */
+function toolUseIds(messages: MessagesRequest["messages"]): Set<string> {
+  const ids = new Set<string>();
+  for (const message of messages ?? []) {
+    if (message.role !== "assistant") continue;
+    for (const block of contentBlocks(message.content)) {
+      if (block.type === "tool_use") ids.add(block.id);
+    }
+  }
+  return ids;
 }
 
 function matchToolCalls(

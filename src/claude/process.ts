@@ -10,7 +10,8 @@
  * An idle process waits for the conversation's next message. A parked one
  * has a turn in flight: its tool handlers block until the API client returns
  * the results. Both hold a concurrency slot and are closed by a timer when
- * nothing arrives.
+ * nothing arrives, or earlier when another request needs the slot: an idle
+ * process at once, a parked one after a grace period.
  */
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { ToolBridge } from "../anthropic/tools.js";

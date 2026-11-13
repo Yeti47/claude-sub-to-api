@@ -19,6 +19,8 @@ const config: Config = {
   defaultMaxTokens: 100,
   parkedTurnTtlMs: 0,
   sessionIdleMs: 0,
+  parkedEvictableAfterMs: 0,
+  queueTimeoutMs: 0,
 };
 
 function fakeQuery(messages: unknown[], capture?: (options: Record<string, unknown>) => void) {
@@ -738,17 +740,98 @@ test("a parked turn is closed when its results do not arrive in time", async () 
   runner.closeAll();
 });
 
-test("a new message closes the conversation's unanswered parked turn", async () => {
+test("a request that moved past a tool call closes the turn parked on it", async () => {
   const { runner, state, run } = toolRunner(["t1"]);
   await run("r1", undefined);
-  const first = state.pending!;
-  const rejected = first.calls()[0]!.result.then(
+  const rejected = state.pending!.calls()[0]!.result.then(
     () => false,
     () => true,
   );
-  await run("r2", undefined);
+  // The user interrupted the tool and wrote a new message instead.
+  await run("r2", undefined, {
+    request: {
+      model: "claude-sonnet-5-5",
+      messages: [
+        { role: "user", content: "find x" },
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "lookup", input: { q: "x" } }] },
+        { role: "user", content: "never mind" },
+      ],
+      tools: [lookupTool],
+    },
+  });
   assert.equal(await rejected, true);
   assert.equal(state.calls, 2);
+  runner.closeAll();
+});
+
+test("an unrelated request with the same key leaves a parked turn alone", async () => {
+  const { runner, state, run } = toolRunner(["t1"], { maxConcurrency: 2 });
+  await run("r1", undefined);
+  // A second agent of the same client session starts its own turn.
+  await run("r2", undefined);
+  const second = await run("r3", ["t1"]);
+  assert.equal(second.reused, true);
+  assert.deepEqual(second.response.content[0], { type: "text", text: "done" });
+  assert.equal(state.calls, 2);
+  runner.closeAll();
+});
+
+test("a waiting request evicts a parked turn once its grace period is over", async () => {
+  const { runner, state, run } = toolRunner(["t1"], { parkedEvictableAfterMs: 40 });
+  await run("r1", undefined);
+  const parked = state.pending!;
+  const started = Date.now();
+  await run("r2", undefined, { conversationKey: "other" });
+  assert.ok(Date.now() - started >= 30);
+  assert.equal(state.calls, 2);
+  assert.deepEqual(parked.pendingIds(), []);
+  runner.closeAll();
+});
+
+test("an idle process is evicted before a parked turn", async () => {
+  const received: string[] = [];
+  const counter = { calls: 0 };
+  const tools = { calls: 0, results: [] as unknown[], pending: undefined as PendingToolRegistry | undefined };
+  const toolProcess = toolQuery(["t1"], tools);
+  const textProcess = persistentQuery(received, counter);
+  const runner = new ClaudeRunner(
+    { ...config, maxConcurrency: 2, sessionIdleMs: 60_000, parkedEvictableAfterMs: 1 },
+    createLogger("error"),
+    ((params: { prompt: AsyncIterable<unknown>; options: Record<string, unknown> }) =>
+      params.options.mcpServers ? toolProcess(params) : textProcess(params)) as never,
+    () => (tools.pending = new PendingToolRegistry()),
+  );
+  const run = (key: string, request: Record<string, unknown>) =>
+    runner.run({
+      conversationKey: key,
+      request: { model: "claude-sonnet-5-5", ...request } as never,
+      signal: new AbortController().signal,
+      requestId: key,
+      stream: false,
+    });
+
+  await run("tools", { messages: [{ role: "user", content: "find x" }], tools: [lookupTool] });
+  const parked = tools.pending!;
+  await run("idle", { messages: [{ role: "user", content: "one" }] });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await run("third", { messages: [{ role: "user", content: "two" }] });
+
+  assert.deepEqual(parked.pendingIds(), ["t1"]);
+  assert.equal(counter.calls, 2);
+  runner.closeAll();
+});
+
+test("a request that finds no free process in time gets a 529 with retry-after", async () => {
+  const { runner, run } = toolRunner(["t1"], { queueTimeoutMs: 30 });
+  await run("r1", undefined);
+  await assert.rejects(
+    () => run("r2", undefined, { conversationKey: "other" }),
+    (error: unknown) =>
+      error instanceof ApiError &&
+      error.status === 529 &&
+      error.type === "overloaded_error" &&
+      error.retryAfter === 10,
+  );
   runner.closeAll();
 });
 

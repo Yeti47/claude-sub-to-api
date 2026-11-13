@@ -152,7 +152,7 @@ Prompt caching improves when:
 - the system prompt and model stay the same for the conversation;
 - the conversation is not idle long enough for the cache to expire.
 
-When Claude calls a client tool, the proxy does not end the CLI turn. The MCP handler blocks, the `tool_use` response is sent, and the process stays alive. The follow-up request is matched to that process by its `tool_use_id`s: it resolves the handlers and continues the same live turn, so the session and cache stay intact. The streamed `message_stop` of a tool-call message is sent only once the turn is parked, so results sent immediately always find it. A follow-up that answers only some of the calls is rejected with a 400 and the turn stays parked. A turn nobody resumes is closed after `PARKED_TURN_TTL_MS` (30 minutes by default).
+When Claude calls a client tool, the proxy does not end the CLI turn. The MCP handler blocks, the `tool_use` response is sent, and the process stays alive. The follow-up request is matched to that process by its `tool_use_id`s: it resolves the handlers and continues the same live turn, so the session and cache stay intact. The streamed `message_stop` of a tool-call message is sent only once the turn is parked, so results sent immediately always find it. A follow-up that answers only some of the calls is rejected with a 400 and the turn stays parked. A request whose history shows the client moved past a tool call without answering it closes the turn parked on that call. A turn nobody resumes is closed after `PARKED_TURN_TTL_MS` (30 minutes by default), or earlier when its process slot is needed (see `PARKED_EVICTABLE_AFTER_MS`).
 
 ## Configuration
 
@@ -171,6 +171,8 @@ All configuration is environment-based.
 | `CLAUDE_CWD` | process cwd | Working directory for the CLI. Use a neutral empty directory for an API-only setup; it keeps repository context out of the prompt. |
 | `STATE_PATH` | `<claude config dir>/sub-to-api-sessions.json` | Persisted Claude sessions and their checkpoints. |
 | `PARKED_TURN_TTL_MS` | `1800000` | How long a tool turn waits for `tool_result` before its process is closed (`0` disables). |
+| `PARKED_EVICTABLE_AFTER_MS` | `60000` | How long a parked tool turn is safe from being closed to free a process for a waiting request (`0` never evicts). |
+| `QUEUE_TIMEOUT_MS` | `30000` | How long a request waits for a free process before it gets a `529` (`0` waits until `REQUEST_TIMEOUT_MS`). |
 | `SESSION_IDLE_MS` | `300000` | How long an idle conversation keeps its Claude process alive (`0` closes it immediately). |
 | `CLAUDE_CODE_MAX_RETRIES` | `0` | CLI API retries. Keep `0` so one API request maps to one model response; clients own retries. |
 
@@ -184,7 +186,7 @@ All configuration is environment-based.
 - Images and documents are passed through as native content blocks. An unprocessable attachment becomes a `400 invalid_request_error`.
 - `metadata` is used only to derive a conversation key; it is not forwarded.
 - The CLI attaches its own environment/account context (working directory, plan tokens, email) to the prompt. `CLAUDE_CWD` controls the directory it sees.
-- One Claude Code process per active conversation, kept for `SESSION_IDLE_MS` (5 minutes) after a turn. `MAX_CONCURRENCY` caps live processes; a new conversation evicts the least-recently-used idle process, or waits when every process is busy or parked. Memory is roughly a few hundred MB per live process.
+- One Claude Code process per active conversation, kept for `SESSION_IDLE_MS` (5 minutes) after a turn. `MAX_CONCURRENCY` caps live processes; a request that needs a process when none is free closes the least-recently-used idle one, or else a tool turn that has been parked for longer than `PARKED_EVICTABLE_AFTER_MS` (its tool results are then replayed into a fork of the session). Otherwise it waits, and after `QUEUE_TIMEOUT_MS` is answered with `529 overloaded_error` and `retry-after`. Memory is roughly a few hundred MB per live process.
 
 ## Secret scanning
 
