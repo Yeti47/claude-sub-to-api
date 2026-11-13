@@ -10,7 +10,12 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Message } from "../anthropic/types.js";
-import { hasToolResult, userMessageHashes } from "./hashes.js";
+import {
+  hasToolResult,
+  historyFingerprint,
+  historyPrefixHashes,
+  userMessageHashes,
+} from "./hashes.js";
 import type { Logger } from "../logger.js";
 
 export interface Checkpoint {
@@ -18,6 +23,8 @@ export interface Checkpoint {
   count: number;
   /** Hash of the last user message in that turn. */
   hash: string;
+  /** Fingerprint of the complete history through this turn. */
+  historyHash: string;
   /** Claude session containing this checkpoint. */
   sessionId: string;
   /** Transcript UUID at the end of the turn. */
@@ -54,16 +61,6 @@ const MAX_BINDINGS = 300;
 const MAX_HASHES = 500;
 const MAX_CHECKPOINTS = 100;
 const MAX_AGE_MS = 30 * 24 * 60 * 60_000;
-
-function fromIndexFor(messages: Message[], matchedUsers: number): number {
-  let seen = 0;
-  for (let index = 0; index < messages.length; index += 1) {
-    if (messages[index]?.role !== "user") continue;
-    seen += 1;
-    if (seen === matchedUsers + 1) return index;
-  }
-  return -1;
-}
 
 export class SessionStore {
   private data: Record<string, Binding> = {};
@@ -125,58 +122,63 @@ export class SessionStore {
       return { kind: "fresh" };
     }
 
-    const hashes = userMessageHashes(input.messages);
-    if (hashes.length === 0) return { kind: "fresh" };
+    const userIndices: number[] = [];
+    for (let index = 0; index < input.messages.length; index += 1) {
+      if (input.messages[index]?.role === "user") userIndices.push(index);
+    }
+    if (userIndices.length === 0) return { kind: "fresh" };
 
-    const matches = (count: number): boolean => {
-      if (count === 0) return true;
-      if (binding.userHashes.length < count || hashes.length < count) return false;
-      for (let index = 0; index < count; index += 1) {
-        if (binding.userHashes[index] !== hashes[index]) return false;
-      }
-      return true;
-    };
+    // One rolling pass gives the history fingerprint at every message index.
+    const prefixHashes = historyPrefixHashes(input.messages);
 
-    // The normal case: the client appended a new turn to the bound history.
+    // A checkpoint is usable only when the client's complete history through
+    // that turn, assistant replies included, still matches the history the
+    // checkpoint recorded. User-only matching would miss an edited reply and
+    // resume a transcript the client no longer has.
+    const matching = (binding.checkpoints ?? [])
+      .filter((checkpoint) => {
+        if (checkpoint.count <= 0 || checkpoint.count >= userIndices.length) return false;
+        if (!checkpoint.leafUuid || !checkpoint.sessionId) return false;
+        if (typeof checkpoint.historyHash !== "string" || !checkpoint.historyHash) {
+          // Legacy checkpoint without a full-history fingerprint.
+          return false;
+        }
+        const boundary = userIndices[checkpoint.count]!;
+        return prefixHashes[boundary - 1] === checkpoint.historyHash;
+      })
+      .sort((a, b) => b.count - a.count);
+
+    const latest = matching[0];
+
+    // The normal case: the client appended a turn after the last completed
+    // one, and that turn's history still matches exactly.
     if (
-      hashes.length > binding.userHashes.length &&
-      matches(binding.userHashes.length)
+      latest &&
+      latest.count === binding.userHashes.length &&
+      latest.sessionId === binding.sessionId &&
+      userIndices.length > latest.count
     ) {
-      const fromIndex = fromIndexFor(input.messages, binding.userHashes.length);
-      if (fromIndex >= 0 && !input.messages.slice(fromIndex).some(hasToolResult)) {
+      const fromIndex = userIndices[latest.count]!;
+      if (!input.messages.slice(fromIndex).some(hasToolResult)) {
         return {
           kind: "resume",
           sessionId: binding.sessionId,
           fromIndex,
-          matchedUsers: binding.userHashes.length,
+          matchedUsers: latest.count,
         };
       }
     }
 
-    // A rewrite, rewind or retry: fork at the last checkpoint that still
-    // matches the incoming history, then send the remaining turns.
-    const target = hashes.length - 1;
-    if (target >= 0) {
-      const checkpoints = [...(binding.checkpoints ?? [])]
-        .filter(
-          (checkpoint) =>
-            checkpoint.count <= target &&
-            checkpoint.leafUuid.length > 0 &&
-            checkpoint.sessionId.length > 0 &&
-            matches(checkpoint.count),
-        )
-        .sort((a, b) => b.count - a.count);
-      for (const checkpoint of checkpoints) {
-        const fromIndex = fromIndexFor(input.messages, checkpoint.count);
-        if (fromIndex < 0) continue;
-        return {
-          kind: "fork",
-          sessionId: checkpoint.sessionId,
-          upToMessageId: checkpoint.leafUuid,
-          fromIndex,
-          matchedUsers: checkpoint.count,
-        };
-      }
+    // A rewrite, rewind or retry: fork at the latest checkpoint whose complete
+    // history still matches, then send the remaining turns.
+    if (latest) {
+      return {
+        kind: "fork",
+        sessionId: latest.sessionId,
+        upToMessageId: latest.leafUuid,
+        fromIndex: userIndices[latest.count]!,
+        matchedUsers: latest.count,
+      };
     }
 
     return { kind: "fresh" };
@@ -188,7 +190,8 @@ export class SessionStore {
     model: string;
     cwd: string;
     systemHash: string;
-    userHashes: string[];
+    /** Complete history through this turn, including the assistant reply. */
+    history: Message[];
     /** Transcript UUID of the final assistant message of this turn. */
     leafUuid?: string;
     /** A tool turn is not a completed checkpoint yet. */
@@ -196,7 +199,8 @@ export class SessionStore {
     /** Decision that started this turn, for checkpoint retention. */
     decision?: ResumeDecision | null;
   }): void {
-    if (input.userHashes.length > MAX_HASHES) return;
+    const userHashes = userMessageHashes(input.history);
+    if (userHashes.length > MAX_HASHES) return;
     const existing = this.data[input.key];
     const decision = input.decision;
     let checkpoints: Checkpoint[];
@@ -213,16 +217,17 @@ export class SessionStore {
         existing.model === input.model &&
         existing.cwd === input.cwd &&
         existing.systemHash === input.systemHash &&
-        existing.userHashes.length <= input.userHashes.length &&
-        existing.userHashes.every((hash, index) => hash === input.userHashes[index])
+        existing.userHashes.length <= userHashes.length &&
+        existing.userHashes.every((hash, index) => hash === userHashes[index])
           ? [...(existing.checkpoints ?? [])]
           : [];
     }
 
-    if (!input.parked && input.leafUuid && input.userHashes.length > 0) {
+    if (!input.parked && input.leafUuid && userHashes.length > 0) {
       const checkpoint: Checkpoint = {
-        count: input.userHashes.length,
-        hash: input.userHashes[input.userHashes.length - 1]!,
+        count: userHashes.length,
+        hash: userHashes[userHashes.length - 1]!,
+        historyHash: historyFingerprint(input.history),
         sessionId: input.sessionId,
         leafUuid: input.leafUuid,
       };
@@ -239,7 +244,7 @@ export class SessionStore {
       model: input.model,
       cwd: input.cwd,
       systemHash: input.systemHash,
-      userHashes: input.userHashes,
+      userHashes,
       ...(checkpoints.length > 0 ? { checkpoints } : {}),
       updatedAt: Date.now(),
     };

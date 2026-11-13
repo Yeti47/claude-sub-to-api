@@ -1,10 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionStore, type Checkpoint } from "../src/session/store.js";
-import { deriveConversationKey, userMessageHashes } from "../src/session/hashes.js";
+import {
+  deriveConversationKey,
+  historyFingerprint,
+  userMessageHashes,
+} from "../src/session/hashes.js";
 import { createLogger } from "../src/logger.js";
 import type { Message } from "../src/anthropic/types.js";
 
@@ -24,7 +28,7 @@ const base = {
 
 function record(
   sessions: SessionStore,
-  messages: Message[],
+  history: Message[],
   sessionId: string,
   leafUuid?: string,
   extra: Partial<Parameters<SessionStore["record"]>[0]> = {},
@@ -33,7 +37,7 @@ function record(
     key: "k",
     sessionId,
     ...base,
-    userHashes: userMessageHashes(messages),
+    history,
     leafUuid,
     ...extra,
   });
@@ -47,10 +51,25 @@ function checkpoints(path: string): Checkpoint[] {
   return data.k?.checkpoints ?? [];
 }
 
+function checkpoint(
+  history: Message[],
+  sessionId: string,
+  leafUuid: string,
+): Checkpoint {
+  const users = userMessageHashes(history);
+  return {
+    count: users.length,
+    hash: users[users.length - 1]!,
+    historyHash: historyFingerprint(history),
+    sessionId,
+    leafUuid,
+  };
+}
+
 test("plans a resume when the user history is an extension", () => {
   const sessions = store();
   const first = [u("one"), a("reply")];
-  record(sessions, first, "s1");
+  record(sessions, first, "s1", "leaf-1");
 
   const plan = sessions.plan({ key: "k", messages: [...first, u("two")], ...base });
   assert.deepEqual(plan, {
@@ -63,32 +82,35 @@ test("plans a resume when the user history is an extension", () => {
 
 test("starts fresh when history diverges and no checkpoint matches", () => {
   const sessions = store();
-  record(sessions, [u("one")], "s1");
+  record(sessions, [u("one"), a("reply")], "s1", "leaf-1");
   assert.deepEqual(
     sessions.plan({ key: "k", messages: [u("different"), u("next")], ...base }),
     { kind: "fresh" },
   );
 });
 
-test("does not resume a tool-result turn", () => {
+test("does not resume a tool-result turn, but forks at the previous checkpoint", () => {
   const sessions = store();
-  const first = [u("one")];
-  record(sessions, first, "s1");
+  const first = [u("one"), a("reply")];
+  record(sessions, first, "s1", "leaf-1");
   const messages: Message[] = [
     ...first,
-    a("calling"),
     {
       role: "user",
       content: [{ type: "tool_result", tool_use_id: "t1", content: "42" }],
     },
   ];
-  assert.deepEqual(sessions.plan({ key: "k", messages, ...base }), { kind: "fresh" });
+  const plan = sessions.plan({ key: "k", messages, ...base });
+  assert.equal(plan.kind, "fork");
+  if (plan.kind !== "fork") return;
+  assert.equal(plan.upToMessageId, "leaf-1");
+  assert.equal(plan.fromIndex, 2);
 });
 
 test("starts fresh when the model or system prompt changes", () => {
   const sessions = store();
-  record(sessions, [u("one")], "s1");
-  const messages = [u("one"), u("two")];
+  record(sessions, [u("one"), a("reply")], "s1", "leaf-1");
+  const messages = [u("one"), a("reply"), u("two")];
   assert.deepEqual(sessions.plan({ key: "k", messages, ...base, model: "other" }), {
     kind: "fresh",
   });
@@ -99,9 +121,11 @@ test("starts fresh when the model or system prompt changes", () => {
 
 test("does not fork a retry with no new user turn", () => {
   const sessions = store();
-  const first = [u("one")];
-  record(sessions, first, "s1", "leaf-1");
-  assert.deepEqual(sessions.plan({ key: "k", messages: first, ...base }), { kind: "fresh" });
+  record(sessions, [u("one"), a("reply")], "s1", "leaf-1");
+  assert.deepEqual(
+    sessions.plan({ key: "k", messages: [u("one")], ...base }),
+    { kind: "fresh" },
+  );
 });
 
 test("forks at the latest checkpoint when the last user turn is rewritten", () => {
@@ -127,14 +151,14 @@ test("forks at the latest checkpoint when the last user turn is rewritten", () =
 
 test("forks at the checkpoint before the rewrite, then sends the remaining turns", () => {
   const sessions = store();
-  const first = [u("one")];
-  const second = [...first, a("reply-1"), u("two")];
+  const first = [u("one"), a("reply-1")];
+  const second = [...first, u("two"), a("reply-2")];
   record(sessions, first, "s1", "leaf-1");
   record(sessions, second, "s1", "leaf-2");
 
   const plan = sessions.plan({
     key: "k",
-    messages: [u("one"), a("reply-1"), u("edited"), a("reply-2"), u("three")],
+    messages: [u("one"), a("reply-1"), u("edited"), a("reply-3"), u("three")],
     ...base,
   });
   assert.equal(plan.kind, "fork");
@@ -146,9 +170,81 @@ test("forks at the checkpoint before the rewrite, then sends the remaining turns
 
 test("does not fork when the first user turn itself changed", () => {
   const sessions = store();
-  record(sessions, [u("one")], "s1", "leaf-1");
+  record(sessions, [u("one"), a("reply")], "s1", "leaf-1");
   assert.deepEqual(
     sessions.plan({ key: "k", messages: [u("different")], ...base }),
+    { kind: "fresh" },
+  );
+});
+
+test("does not resume when an earlier assistant reply was edited", () => {
+  const sessions = store();
+  const first = [u("one"), a("reply-1")];
+  const second = [...first, u("two"), a("reply-2")];
+  record(sessions, first, "s1", "leaf-1");
+  record(sessions, second, "s1", "leaf-2");
+
+  const plan = sessions.plan({
+    key: "k",
+    messages: [
+      u("one"),
+      a("edited reply-1"),
+      u("two"),
+      a("reply-2"),
+      u("three"),
+    ],
+    ...base,
+  });
+  assert.deepEqual(plan, { kind: "fresh" });
+});
+
+test("forks at the checkpoint before an edited assistant reply", () => {
+  const sessions = store();
+  const first = [u("one"), a("reply-1")];
+  const second = [...first, u("two"), a("reply-2")];
+  const third = [...second, u("three"), a("reply-3")];
+  record(sessions, first, "s1", "leaf-1");
+  record(sessions, second, "s1", "leaf-2");
+  record(sessions, third, "s1", "leaf-3");
+
+  const plan = sessions.plan({
+    key: "k",
+    messages: [u("one"), a("reply-1"), u("two"), a("edited reply-2"), u("three")],
+    ...base,
+  });
+  assert.equal(plan.kind, "fork");
+  if (plan.kind !== "fork") return;
+  assert.equal(plan.upToMessageId, "leaf-1");
+  assert.equal(plan.fromIndex, 2);
+});
+
+test("ignores a checkpoint without a complete-history fingerprint", () => {
+  const dir = mkdtempSync(join(tmpdir(), "sessions-"));
+  const path = join(dir, "sessions.json");
+  const history = [u("one"), a("reply")];
+  writeFileSync(
+    path,
+    JSON.stringify({
+      k: {
+        sessionId: "s1",
+        ...base,
+        userHashes: userMessageHashes(history),
+        checkpoints: [
+          {
+            count: 1,
+            hash: userMessageHashes(history)[0],
+            sessionId: "s1",
+            leafUuid: "leaf-1",
+          },
+        ],
+        updatedAt: Date.now(),
+      },
+    }),
+  );
+
+  const sessions = new SessionStore(path, logger);
+  assert.deepEqual(
+    sessions.plan({ key: "k", messages: [...history, u("two")], ...base }),
     { kind: "fresh" },
   );
 });
@@ -157,34 +253,36 @@ test("records and replaces a checkpoint at the same user count", () => {
   const dir = mkdtempSync(join(tmpdir(), "sessions-"));
   const path = join(dir, "sessions.json");
   const sessions = new SessionStore(path, logger);
-  record(sessions, [u("one")], "s1", "leaf-1");
-  record(sessions, [u("one")], "s1", "leaf-2");
-  assert.deepEqual(checkpoints(path), [
-    { count: 1, hash: userMessageHashes([u("one")])[0], sessionId: "s1", leafUuid: "leaf-2" },
-  ]);
+  const history = [u("one"), a("reply")];
+  record(sessions, history, "s1", "leaf-1");
+  record(sessions, history, "s1", "leaf-2");
+  assert.deepEqual(checkpoints(path), [checkpoint(history, "s1", "leaf-2")]);
 });
 
 test("a fresh decision clears old checkpoints", () => {
   const dir = mkdtempSync(join(tmpdir(), "sessions-"));
   const path = join(dir, "sessions.json");
   const sessions = new SessionStore(path, logger);
-  record(sessions, [u("one")], "s1", "leaf-1");
-  record(sessions, [u("one"), a("reply"), u("two")], "s1", "leaf-2");
-  record(sessions, [u("one")], "s2", "leaf-3", { decision: { kind: "fresh" } });
-  assert.deepEqual(checkpoints(path), [
-    { count: 1, hash: userMessageHashes([u("one")])[0], sessionId: "s2", leafUuid: "leaf-3" },
-  ]);
+  const first = [u("one"), a("reply")];
+  record(sessions, first, "s1", "leaf-1");
+  record(sessions, [...first, u("two"), a("reply")], "s1", "leaf-2");
+  record(sessions, first, "s2", "leaf-3", { decision: { kind: "fresh" } });
+  assert.deepEqual(checkpoints(path), [checkpoint(first, "s2", "leaf-3")]);
 });
 
 test("a fork decision keeps only checkpoints up to the fork point", () => {
   const dir = mkdtempSync(join(tmpdir(), "sessions-"));
   const path = join(dir, "sessions.json");
   const sessions = new SessionStore(path, logger);
-  record(sessions, [u("one")], "s1", "leaf-1");
-  record(sessions, [u("one"), a("reply"), u("two")], "s1", "leaf-2");
-  record(sessions, [u("one"), a("reply"), u("two"), a("reply"), u("three")], "s1", "leaf-3");
+  const first = [u("one"), a("reply")];
+  const second = [...first, u("two"), a("reply")];
+  const third = [...second, u("three"), a("reply")];
+  record(sessions, first, "s1", "leaf-1");
+  record(sessions, second, "s1", "leaf-2");
+  record(sessions, third, "s1", "leaf-3");
 
-  record(sessions, [u("one"), a("reply"), u("edited")], "s2", "leaf-4", {
+  const forked = [u("one"), a("reply"), u("edited"), a("edited reply")];
+  record(sessions, forked, "s2", "leaf-4", {
     decision: {
       kind: "fork",
       sessionId: "s1",
@@ -194,34 +292,48 @@ test("a fork decision keeps only checkpoints up to the fork point", () => {
     },
   });
 
-  const stored = checkpoints(path);
-  assert.equal(stored.length, 2);
-  assert.equal(stored[0]?.count, 1);
-  assert.equal(stored[0]?.sessionId, "s1");
-  assert.equal(stored[1]?.count, 2);
-  assert.equal(stored[1]?.sessionId, "s2");
-  assert.equal(stored[1]?.leafUuid, "leaf-4");
+  assert.deepEqual(checkpoints(path), [
+    checkpoint(first, "s1", "leaf-1"),
+    checkpoint(forked, "s2", "leaf-4"),
+  ]);
 });
 
 test("a parked tool turn updates the binding but records no checkpoint", () => {
   const dir = mkdtempSync(join(tmpdir(), "sessions-"));
   const path = join(dir, "sessions.json");
   const sessions = new SessionStore(path, logger);
-  record(sessions, [u("one")], "s1", "leaf-1");
+  const first = [u("one"), a("reply")];
+  record(sessions, first, "s1", "leaf-1");
 
-  record(sessions, [u("one"), a("tool"), u("two")], "s2", "leaf-2", { parked: true });
-  assert.deepEqual(checkpoints(path), [
-    { count: 1, hash: userMessageHashes([u("one")])[0], sessionId: "s1", leafUuid: "leaf-1" },
-  ]);
+  const parked = [...first, u("two"), a("tool")];
+  record(sessions, parked, "s1", "leaf-2", { parked: true });
+  assert.deepEqual(checkpoints(path), [checkpoint(first, "s1", "leaf-1")]);
 
-  const plan = sessions.plan({
-    key: "k",
-    messages: [u("one"), a("tool"), u("two")],
-    ...base,
-  });
+  const plan = sessions.plan({ key: "k", messages: parked, ...base });
   assert.equal(plan.kind, "fork");
   if (plan.kind !== "fork") return;
   assert.equal(plan.upToMessageId, "leaf-1");
+});
+
+test("a continuation drops checkpoints from an unrelated session", () => {
+  const dir = mkdtempSync(join(tmpdir(), "sessions-"));
+  const path = join(dir, "sessions.json");
+  const sessions = new SessionStore(path, logger);
+  const first = [u("one"), a("reply")];
+  record(sessions, first, "s1", "leaf-1");
+
+  const continued = [...first, u("two"), a("reply")];
+  record(sessions, continued, "s2", "leaf-2");
+  assert.deepEqual(checkpoints(path), [checkpoint(continued, "s2", "leaf-2")]);
+
+  assert.deepEqual(
+    sessions.plan({
+      key: "k",
+      messages: [u("one"), a("reply"), u("edited")],
+      ...base,
+    }),
+    { kind: "fresh" },
+  );
 });
 
 test("forks before a tool exchange when the parked turn is gone", () => {
@@ -255,8 +367,9 @@ test("reloads checkpoints from disk", () => {
   const dir = mkdtempSync(join(tmpdir(), "sessions-"));
   const path = join(dir, "sessions.json");
   const first = new SessionStore(path, logger);
-  record(first, [u("one")], "s1", "leaf-1");
-  record(first, [u("one"), a("reply"), u("two")], "s1", "leaf-2");
+  const one = [u("one"), a("reply")];
+  record(first, one, "s1", "leaf-1");
+  record(first, [...one, u("two"), a("reply")], "s1", "leaf-2");
 
   const second = new SessionStore(path, logger);
   const plan = second.plan({

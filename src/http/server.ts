@@ -10,7 +10,7 @@ import { ApiError, ClientAbort, ClaudeRunner, type RunResult } from "../claude/r
 import type { ModelCatalog } from "../claude/models.js";
 import type { SessionStore, ResumeDecision } from "../session/store.js";
 import type { ParkedTurnStore } from "../claude/parked.js";
-import { deriveConversationKey, systemHash, userMessageHashes } from "../session/hashes.js";
+import { deriveConversationKey, systemHash } from "../session/hashes.js";
 import { SseWriter } from "./sse.js";
 
 const MAX_BODY = 32 << 20;
@@ -132,7 +132,6 @@ export function createHandler(deps: Deps) {
       sessionHeader(req),
       request.metadata?.user_id,
     );
-    const hashes = userMessageHashes(request.messages);
     const promptHash = systemHash(systemText(request.system) ?? null);
     const plan = () =>
       deps.sessions.plan({
@@ -151,7 +150,10 @@ export function createHandler(deps: Deps) {
         model: request.model,
         cwd: config.cwd,
         systemHash: promptHash,
-        userHashes: hashes,
+        history: [
+          ...request.messages,
+          { role: "assistant", content: result.response.content },
+        ],
         leafUuid: result.leafUuid,
         parked: Boolean(result.parked),
         decision,
