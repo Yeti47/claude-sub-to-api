@@ -18,6 +18,9 @@ RUN npm ci --omit=dev && npm cache clean --force
 # ---- Runtime ----
 FROM node:24-bookworm-slim
 ENV NODE_ENV=production
+# The server binds to loopback by default; inside a container it has to
+# listen on every interface for the published port to reach it.
+ENV LISTEN_ADDR=:8080
 WORKDIR /app
 
 COPY --from=deps /app/node_modules ./node_modules

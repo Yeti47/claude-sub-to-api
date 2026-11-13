@@ -60,6 +60,8 @@ Anthropic
    docker compose up -d --build
    ```
 
+   The compose file publishes the port on `127.0.0.1` only. To reach the proxy from another machine, put a TLS reverse proxy in front of it or change the port mapping to `8080:8080`.
+
 The container mounts `~/.config/claude-sub-to-api` at `/data` and uses it as `CLAUDE_CONFIG_DIR`. The token is passed in the environment, not written to disk. The proxy writes `.claude.json` in that directory (`/data/.claude.json`) with `"hasCompletedOnboarding": true` so the CLI starts headlessly; the same directory also holds session transcripts used for resume. It must stay writable.
 
 When `CLAUDE_CONFIG_DIR` is not set (for example in local development), the CLI keeps `.claude.json` in `$HOME` and its state in `~/.claude`; the proxy follows the same layout.
@@ -86,6 +88,12 @@ curl -N http://localhost:8080/v1/messages \
 curl http://localhost:8080/v1/models -H "x-api-key: $PROXY_API_KEY"
 
 # Health (no auth)
+# Token estimate (see Limitations)
+curl http://localhost:8080/v1/messages/count_tokens \
+  -H "content-type: application/json" \
+  -H "x-api-key: $PROXY_API_KEY" \
+  -d '{"model":"claude-opus-5-5","messages":[{"role":"user","content":"Say hi in one word."}]}'
+
 curl http://localhost:8080/healthz
 ```
 
@@ -137,7 +145,7 @@ While a conversation is live, the proxy keeps one Claude process per session and
 
 When a request extends the history of a session's last completed turn, the proxy resumes that session and sends only the new turn instead of replaying a reconstructed transcript. When the client rewinds, edits, retries or branches history, the proxy forks the session at the matching checkpoint and resumes the fork; earlier turns keep their transcript and prompt cache. A session is also forked, not resumed, while another request is still running on it. The same applies after a turn that failed, timed out or was aborted once its prompt had reached Claude: the transcript may then hold a partial exchange the client never saw, so the retry forks at the last completed turn instead of appending after it. Without a matching checkpoint (for example, the first user turn changed, or an earlier assistant reply was edited), it replays the transcript into a fresh session. Tool-result turns are handled by the parked-tool bridge below.
 
-A checkpoint is written only when a turn completes. A turn that parks on a tool call adds no checkpoint; its continuation records one when it finishes. Checkpoints belong to the session that produced them and stay usable after a fork, so a later request can return to the original branch or fork an older session again. A conversation has no length limit; each session keeps its 100 most recent checkpoints, and the 300 most recently used sessions are kept for 30 days.
+A checkpoint is written only when a turn completes. A turn that parks on a tool call adds no checkpoint; its continuation records one when it finishes. Checkpoints belong to the session that produced them and stay usable after a fork, so a later request can return to the original branch or fork an older session again. A conversation has no length limit; each session keeps its 100 most recent checkpoints, and the 300 most recently used sessions are kept for 30 days. The transcript of a session dropped from that list is deleted. State changes are written to `STATE_PATH` in the background, shortly after they happen, and once more on shutdown.
 
 This is the same mechanism [opencode-claude](https://github.com/openchamber/opencode-claude) uses. With the stable harness prompt (`excludeDynamicSections: true`) and resume, a live two-turn Haiku test showed real cache reuse:
 
@@ -152,7 +160,7 @@ Prompt caching improves when:
 - the system prompt and model stay the same for the conversation;
 - the conversation is not idle long enough for the cache to expire.
 
-When Claude calls a client tool, the proxy does not end the CLI turn. The MCP handler blocks, the `tool_use` response is sent, and the process stays alive. The follow-up request is matched to that process by its `tool_use_id`s: it resolves the handlers and continues the same live turn, so the session and cache stay intact. The streamed `message_stop` of a tool-call message is sent only once the turn is parked, so results sent immediately always find it. A follow-up that answers only some of the calls is rejected with a 400 and the turn stays parked. A request whose history shows the client moved past a tool call without answering it closes the turn parked on that call. A turn nobody resumes is closed after `PARKED_TURN_TTL_MS` (30 minutes by default), or earlier when its process slot is needed (see `PARKED_EVICTABLE_AFTER_MS`).
+When Claude calls a client tool, the proxy does not end the CLI turn. The MCP handler blocks, the `tool_use` response is sent, and the process stays alive. The follow-up request is matched to that process by its `tool_use_id`s: it resolves the handlers and continues the same live turn, so the session and cache stay intact. The streamed `message_stop` of a tool-call message is sent only once the turn is parked, so results sent immediately always find it. A follow-up that answers only some of the calls is rejected with a 400 and the turn stays parked. A request whose history shows the client moved past a tool call without answering it closes the turn parked on that call. Tool results that arrive with a different model, system prompt or tool set than the parked turn was started with do not continue it; that turn is closed and the request is handled like a rewritten history. A turn nobody resumes is closed after `PARKED_TURN_TTL_MS` (30 minutes by default), or earlier when its process slot is needed (see `PARKED_EVICTABLE_AFTER_MS`).
 
 ## Configuration
 
@@ -163,7 +171,7 @@ All configuration is environment-based.
 | `PROXY_API_KEY` | — (required) | Static key consumers present. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | — (required) | Long-lived token from `claude setup-token`. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Writable directory for the CLI's `.claude.json`, session transcripts, and state. `/data` in Docker. |
-| `LISTEN_ADDR` | `:8080` | Bind address. |
+| `LISTEN_ADDR` | `127.0.0.1:8080` | Bind address. Loopback only by default; the Docker image sets `:8080`. Use `:8080` or `0.0.0.0:8080` to accept connections from other machines, preferably behind a TLS reverse proxy. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 | `MAX_CONCURRENCY` | `4` | Maximum simultaneous live Claude Code processes. |
 | `REQUEST_TIMEOUT_MS` | `900000` | Per-request upper bound. |
@@ -183,6 +191,7 @@ All configuration is environment-based.
 - Sampling parameters (`temperature`, `top_p`, `top_k`) and `stop_sequences` are not exposed by the Agent SDK and are ignored. `max_tokens` sets the CLI's output ceiling; models that reason even with thinking disabled can spend part of that ceiling before answering, so the proxy gives short requests a 1024-token floor.
 - Thinking blocks are returned only when the request asks for thinking. Some models reason internally even when it is off; those blocks are dropped.
 - Errors use Anthropic's error body and status codes. A streaming request is not answered with `200` until its first event exists, so a failure before that (rate limit, authentication, an invalid request) is a normal HTTP error response, with `retry-after` on a `429` when the subscription's reset time is known. A failure after the stream started is sent as an `error` event.
+- `POST /v1/messages/count_tokens` returns an estimate from the request's size (about 3 characters per token, a flat cost per image or document), not Claude's tokenizer. It is meant for clients that use the number to decide when to compact, and errs on the high side. It does not include the Claude Code harness prompt.
 - Images and documents are passed through as native content blocks. An unprocessable attachment becomes a `400 invalid_request_error`.
 - `metadata` is used only to derive a conversation key; it is not forwarded.
 - The CLI attaches its own environment/account context (working directory, plan tokens, email) to the prompt. `CLAUDE_CWD` controls the directory it sees.

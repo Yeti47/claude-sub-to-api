@@ -46,7 +46,7 @@ function systemPromptOption(clientSystem: string | undefined): Record<string, un
   };
 }
 
-function childEnv(config: Config, maxTokens: number): Record<string, string> {
+export function childEnv(config: Config, maxTokens: number): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (value !== undefined) env[key] = value;
@@ -79,6 +79,8 @@ function childEnv(config: Config, maxTokens: number): Record<string, string> {
   // model messages for one API request, which cannot be represented as one
   // Anthropic response (especially in a stream).
   if (!env.CLAUDE_CODE_MAX_RETRIES) env.CLAUDE_CODE_MAX_RETRIES = "0";
+  // The key API clients present to this proxy is no business of the CLI.
+  delete env.PROXY_API_KEY;
   // The CLI is driven by an API client, not a terminal user.
   delete env.ANTHROPIC_API_KEY;
   delete env.ANTHROPIC_AUTH_TOKEN;
@@ -182,6 +184,19 @@ export function launchKey(config: Config, request: MessagesRequest, prepared: Pr
     effort: request.output_config?.effort ?? null,
     cwd: config.cwd,
     configDir: config.claudeConfigDir,
+  });
+}
+
+/**
+ * What a turn in flight cannot change: the model, system prompt and tools it
+ * was started with. Tool results only continue a parked turn with the same
+ * identity.
+ */
+export function turnIdentity(request: MessagesRequest, prepared: PreparedTurn): string {
+  return stableStringify({
+    model: request.model,
+    system: prepared.system ?? null,
+    tools: prepared.tools,
   });
 }
 

@@ -14,6 +14,7 @@
  * conversations that happen to share a key still find their own sessions.
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { Message } from "../anthropic/types.js";
 import { hasToolResult, historyFingerprint, historyPrefixHashes } from "./hashes.js";
@@ -69,6 +70,8 @@ export type ResumeDecision =
 const MAX_SESSIONS = 300;
 const MAX_CHECKPOINTS = 100;
 const MAX_AGE_MS = 30 * 24 * 60 * 60_000;
+/** Changes within this window are written to disk together. */
+const SAVE_DELAY_MS = 250;
 
 function scopeKey(scope: SessionScope): string {
   return JSON.stringify([scope.model, scope.cwd, scope.systemHash]);
@@ -82,10 +85,20 @@ export class SessionStore {
   private sessions = new Map<string, SessionEntry>();
   /** Scope and history fingerprint -> the session holding that checkpoint. */
   private index = new Map<string, string>();
+  /** Bumped on every change; `written` is the revision last put on disk. */
+  private revision = 0;
+  private written = 0;
+  private saveTimer: ReturnType<typeof setTimeout> | undefined;
+  private writing: Promise<void> | undefined;
 
+  /**
+   * @param onPruned Called for a session dropped for age or to stay within
+   *   the session limit, so its transcript can be deleted.
+   */
   constructor(
     private readonly path: string | undefined,
     private readonly logger: Logger,
+    private readonly onPruned?: (sessionId: string, cwd: string) => void,
   ) {
     this.load();
   }
@@ -113,14 +126,71 @@ export class SessionStore {
     }
   }
 
+  /**
+   * Note a change. The state is rewritten whole, so a burst of changes is
+   * collected into one write, done off the request path.
+   */
   private save(): void {
-    if (!this.path) return;
+    this.revision += 1;
+    this.schedule();
+  }
+
+  private schedule(): void {
+    // A write in progress schedules the next one itself when it is done.
+    if (!this.path || this.saveTimer || this.writing) return;
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = undefined;
+      void this.write();
+    }, SAVE_DELAY_MS);
+    this.saveTimer.unref?.();
+  }
+
+  private serialize(): string {
+    const file: StateFile = { version: 2, sessions: Object.fromEntries(this.sessions) };
+    return `${JSON.stringify(file)}\n`;
+  }
+
+  private async write(): Promise<void> {
+    const path = this.path;
+    if (!path || this.writing || this.written >= this.revision) return;
+    const revision = this.revision;
+    const data = this.serialize();
+    const tmp = `${path}.tmp`;
+    this.writing = (async () => {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(tmp, data, "utf8");
+      // flush() may have written a newer revision in the meantime.
+      if (this.written >= revision) {
+        await rm(tmp, { force: true });
+        return;
+      }
+      await rename(tmp, path);
+      this.written = revision;
+    })();
+    try {
+      await this.writing;
+      this.writing = undefined;
+      if (this.written < this.revision) this.schedule();
+    } catch (error) {
+      // The next change tries again.
+      this.writing = undefined;
+      this.logger.warn("could not write session state", { path, error: String(error) });
+    }
+  }
+
+  /** Write pending changes now. Synchronous, for shutdown. */
+  flush(): void {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = undefined;
+    }
+    if (!this.path || this.written >= this.revision) return;
     try {
       mkdirSync(dirname(this.path), { recursive: true });
-      const tmp = `${this.path}.tmp`;
-      const file: StateFile = { version: 2, sessions: Object.fromEntries(this.sessions) };
-      writeFileSync(tmp, `${JSON.stringify(file)}\n`, "utf8");
+      const tmp = `${this.path}.flush.tmp`;
+      writeFileSync(tmp, this.serialize(), "utf8");
       renameSync(tmp, this.path);
+      this.written = this.revision;
     } catch (error) {
       this.logger.warn("could not write session state", {
         path: this.path,
@@ -157,6 +227,7 @@ export class SessionStore {
       if (!session || !checkpoint) continue;
       if (input.now !== undefined && input.now - session.updatedAt > MAX_AGE_MS) {
         this.forget(sessionId);
+        this.onPruned?.(sessionId, session.cwd);
         continue;
       }
 
@@ -186,7 +257,11 @@ export class SessionStore {
     const session = this.sessions.get(decision.sessionId);
     if (!session) return;
     session.updatedAt = Date.now();
-    if (decision.kind === "resume") session.tip = "";
+    if (decision.kind === "resume") {
+      session.tip = "";
+      // Persisted, so a turn that fails still forks after a restart.
+      this.save();
+    }
   }
 
   /**
@@ -201,6 +276,7 @@ export class SessionStore {
     if (!session || session.tip !== "") return;
     if (session.checkpoints.some((item) => item.historyHash === decision.historyHash)) {
       session.tip = decision.historyHash;
+      this.save();
     }
   }
 
@@ -274,7 +350,10 @@ export class SessionStore {
     const oldest = [...this.sessions.entries()]
       .sort(([, a], [, b]) => a.updatedAt - b.updatedAt)
       .slice(0, this.sessions.size - MAX_SESSIONS);
-    for (const [sessionId] of oldest) this.forget(sessionId, false);
+    for (const [sessionId, session] of oldest) {
+      this.forget(sessionId, false);
+      this.onPruned?.(sessionId, session.cwd);
+    }
   }
 }
 
