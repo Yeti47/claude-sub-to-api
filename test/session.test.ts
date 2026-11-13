@@ -278,6 +278,33 @@ test("keeps recording checkpoints in a long conversation", () => {
   });
 });
 
+test("forgetting one of two sessions with the same history keeps the other", () => {
+  const sessions = store();
+  const first = [u("one"), a("reply")];
+  record(sessions, first, "s1", "leaf-1");
+  record(sessions, first, "s2", "leaf-2");
+
+  sessions.forget("s2");
+  const decision = plan(sessions, [...first, u("two")]);
+  assert.equal(decision.kind, "resume");
+  if (decision.kind === "resume") assert.equal(decision.sessionId, "s1");
+
+  sessions.forget("s1");
+  assert.deepEqual(plan(sessions, [...first, u("two")]), { kind: "fresh" });
+});
+
+test("a claim is written to disk", () => {
+  const path = tempPath();
+  const sessions = new SessionStore(path, logger);
+  const first = [u("one"), a("reply")];
+  const messages = [...first, u("two")];
+  record(sessions, first, "s1", "leaf-1");
+  sessions.claim(plan(sessions, messages));
+
+  // After a restart mid-turn the session is forked, not resumed.
+  assert.equal(plan(new SessionStore(path, logger), messages).kind, "fork");
+});
+
 test("a forgotten session no longer matches", () => {
   const sessions = store();
   const first = [u("one"), a("reply")];
