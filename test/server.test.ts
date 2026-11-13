@@ -7,7 +7,6 @@ import { createLogger } from "../src/logger.js";
 import type { Config } from "../src/config.js";
 import type { MessagesResponse } from "../src/anthropic/types.js";
 import { SessionStore, type ResumeDecision } from "../src/session/store.js";
-import { ParkedTurnStore } from "../src/claude/parked.js";
 import type { RunResult } from "../src/claude/runner.js";
 
 const config: Config = {
@@ -56,7 +55,6 @@ async function withServer(
     models: { list: async () => [{ type: "model", id: "claude-sonnet-5-5", display_name: "Sonnet", created_at: "2025-01-01T00:00:00Z" }] } as never,
     auth: { status: async () => ({ ok: true, detail: "test" }), cleanup: async () => {} },
     sessions: new SessionStore(undefined, createLogger("error")),
-    parked: new ParkedTurnStore(createLogger("error"), 0),
     ...overrides,
   });
   const server = createServer((req, res) => void handler(req, res));

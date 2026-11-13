@@ -76,6 +76,8 @@ export class MessageAssembler {
   private indexMap = new Map<number, number>();
   private suppressed = new Set<number>();
   private nextIndex = 0;
+  /** Closing events of a tool-call message, kept until the turn is parked. */
+  private held: Record<string, unknown>[] = [];
 
   constructor(
     readonly requestedModel: string,
@@ -88,6 +90,21 @@ export class MessageAssembler {
 
   private emit(event: Record<string, unknown>): void {
     this.onEvent?.(event);
+  }
+
+  /**
+   * A client may answer a tool call the moment it sees the message end. Hold
+   * the closing events of such a message back until the caller has parked
+   * the turn and calls `flush`, so the tool results always find it.
+   */
+  private emitClosing(event: Record<string, unknown>): void {
+    if (this.sawToolUse) this.held.push(event);
+    else this.emit(event);
+  }
+
+  /** Send the closing events that were held back. */
+  flush(): void {
+    for (const event of this.held.splice(0)) this.emit(event);
   }
 
   handle(message: unknown): void {
@@ -137,6 +154,7 @@ export class MessageAssembler {
       this.blocks.clear();
       this.indexMap.clear();
       this.suppressed.clear();
+      this.held = [];
       this.nextIndex = 0;
       this.content = [];
       this.stopReason = null;
@@ -210,13 +228,13 @@ export class MessageAssembler {
         this.stopSequence = (delta.stop_sequence as string) ?? null;
       }
       this.usage = mergeUsage(this.usage, event.usage);
-      this.emit(event);
+      this.emitClosing(event);
       return;
     }
 
     if (type === "message_stop") {
       this.sawMessageStop = true;
-      this.emit(event);
+      this.emitClosing(event);
       return;
     }
 

@@ -4,12 +4,11 @@ import type { Config } from "../config.js";
 import type { Logger } from "../logger.js";
 import { isAuthorized } from "../auth/api-key.js";
 import type { PreparedAuth } from "../auth/claude-auth.js";
-import type { Message, MessagesRequest, ToolResultBlock } from "../anthropic/types.js";
-import { contentBlocks, systemText } from "../anthropic/translate.js";
+import type { MessagesRequest } from "../anthropic/types.js";
+import { systemText } from "../anthropic/translate.js";
 import { ApiError, ClientAbort, ClaudeRunner, type RunResult } from "../claude/runner.js";
 import type { ModelCatalog } from "../claude/models.js";
 import type { SessionStore, ResumeDecision } from "../session/store.js";
-import type { ParkedTurnStore } from "../claude/parked.js";
 import { deriveConversationKey, systemHash } from "../session/hashes.js";
 import { SseWriter } from "./sse.js";
 
@@ -23,7 +22,6 @@ interface Deps {
   models: ModelCatalog;
   auth: PreparedAuth;
   sessions: SessionStore;
-  parked: ParkedTurnStore;
 }
 
 function sessionHeader(req: IncomingMessage): string | undefined {
@@ -32,24 +30,6 @@ function sessionHeader(req: IncomingMessage): string | undefined {
     if (typeof value === "string" && value.trim()) return value.trim();
   }
   return undefined;
-}
-
-function lastToolResults(messages: Message[]): {
-  results: Map<string, ToolResultBlock>;
-  steeringText: string;
-} {
-  const results = new Map<string, ToolResultBlock>();
-  let steeringText = "";
-  const lastUser = [...(messages ?? [])].reverse().find((message) => message.role === "user");
-  if (!lastUser) return { results, steeringText };
-  for (const block of contentBlocks(lastUser.content)) {
-    if (block.type === "tool_result") {
-      results.set(block.tool_use_id, block);
-    } else if (block.type === "text" && block.text.trim()) {
-      steeringText += `${steeringText ? "\n" : ""}${block.text}`;
-    }
-  }
-  return { results, steeringText };
 }
 
 export function createHandler(deps: Deps) {
@@ -167,69 +147,21 @@ export function createHandler(deps: Deps) {
     const forget = (sessionId: string) => deps.sessions.forget(sessionId);
 
     try {
-      const toolResults = lastToolResults(request.messages);
-      let parked =
-        toolResults.results.size > 0
-          ? deps.parked.find(key, [...toolResults.results.keys()])
-          : undefined;
-      // The client can send tool results as soon as it sees message_stop,
-      // before the runner has finished registering the handlers. Give the
-      // just-parked turn a moment to appear in the store.
-      if (!parked && toolResults.results.size > 0) {
-        for (let attempt = 0; attempt < 4 && !parked; attempt += 1) {
-          await new Promise((resolve) => setTimeout(resolve, 50));
-          parked = deps.parked.find(key, [...toolResults.results.keys()]);
-        }
-      }
-      let result: RunResult;
-
-      if (parked) {
-        const missing = parked.pendingIds().filter((id) => !toolResults.results.has(id));
-        if (missing.length > 0) {
-          throw new ApiError(
-            400,
-            "invalid_request_error",
-            `missing tool_result for ${missing.join(", ")}`,
-          );
-        }
-        if (controller.signal.aborted) throw new ClientAbort();
-        deps.parked.remove(parked);
-        try {
-          result = await parked.resume({
-            conversationKey: key,
-            request,
-            signal: controller.signal,
-            requestId,
-            stream,
-            onEvent: writer ? (event) => writer!.event(event) : undefined,
-            toolResults: toolResults.results,
-            steeringText: toolResults.steeringText,
-            record,
-          });
-        } catch (error) {
-          if (error instanceof ClientAbort && parked.pendingIds().length > 0) {
-            deps.parked.add(key, parked);
-          }
-          throw error;
-        }
-        if (result.parked) deps.parked.add(key, result.parked);
-      } else {
-        deps.parked.close(key, "Superseded by a new request");
-        result = await deps.runner.run({
-          conversationKey: key,
-          request,
-          signal: controller.signal,
-          requestId,
-          stream,
-          onEvent: writer ? (event) => writer!.event(event) : undefined,
-          persistSession: true,
-          plan,
-          record,
-          release,
-          forget,
-        });
-        if (result.parked) deps.parked.add(key, result.parked);
-      }
+      // The runner routes the request: tool results continue the parked turn
+      // that asked for them, anything else follows the session plan.
+      const result = await deps.runner.run({
+        conversationKey: key,
+        request,
+        signal: controller.signal,
+        requestId,
+        stream,
+        onEvent: writer ? (event) => writer!.event(event) : undefined,
+        persistSession: true,
+        plan,
+        record,
+        release,
+        forget,
+      });
 
       const response = result.response;
       if (writer) {

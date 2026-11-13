@@ -152,7 +152,7 @@ Prompt caching improves when:
 - the system prompt and model stay the same for the conversation;
 - the conversation is not idle long enough for the cache to expire.
 
-When Claude calls a client tool, the proxy does not end the CLI turn. The MCP handler blocks, the `tool_use` response is sent, and the process stays alive. The follow-up request with `tool_result` resolves the handler and continues the same live turn, so the session and cache stay intact. A turn nobody resumes is closed after `PARKED_TURN_TTL_MS` (30 minutes by default).
+When Claude calls a client tool, the proxy does not end the CLI turn. The MCP handler blocks, the `tool_use` response is sent, and the process stays alive. The follow-up request is matched to that process by its `tool_use_id`s: it resolves the handlers and continues the same live turn, so the session and cache stay intact. The streamed `message_stop` of a tool-call message is sent only once the turn is parked, so results sent immediately always find it. A follow-up that answers only some of the calls is rejected with a 400 and the turn stays parked. A turn nobody resumes is closed after `PARKED_TURN_TTL_MS` (30 minutes by default).
 
 ## Configuration
 
