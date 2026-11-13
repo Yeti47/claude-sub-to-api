@@ -21,6 +21,7 @@ import {
 } from "./pending-tools.js";
 import { ParkedTurn, type ResumeParkedInput } from "./parked.js";
 import { TurnInput } from "./turn-input.js";
+import { KeyedLock } from "./keyed-lock.js";
 
 export class ApiError extends Error {
   constructor(readonly status: number, readonly type: string, message: string) {
@@ -64,6 +65,10 @@ export interface RunInput {
   resumeFromIndex?: number;
   /** Persist the CLI transcript so a later request can resume it. */
   persistSession?: boolean;
+  /** Recompute the resume plan inside the conversation lock. */
+  plan?: () => { sessionId: string; fromIndex: number } | null;
+  /** Persist the session binding before the conversation lock is released. */
+  record?: (result: RunResult) => void;
 }
 
 export interface RunResult {
@@ -73,6 +78,8 @@ export interface RunResult {
   parked?: ParkedTurn;
   /** Whether this turn reused an already-running Claude process. */
   reused?: boolean;
+  /** Whether this turn started a new process from a resumed session. */
+  resumed?: boolean;
 }
 
 interface TurnState {
@@ -237,27 +244,40 @@ export class ClaudeRunner {
   }
 
   private readonly processes = new Map<string, TurnState>();
-  private readonly locks = new Map<string, Promise<void>>();
+  private readonly locks = new KeyedLock();
 
   async run(input: RunInput): Promise<RunResult> {
-    return this.withLock(input.conversationKey, () => this.runLocked(input));
+    let release: (() => void) | undefined;
+    try {
+      release = await this.locks.acquire(input.conversationKey, input.signal);
+    } catch {
+      throw new ClientAbort();
+    }
+    try {
+      return await this.runLocked(input);
+    } finally {
+      release();
+    }
   }
 
   private async runLocked(input: RunInput): Promise<RunResult> {
     if (input.signal.aborted) throw new ClientAbort();
-    let prepared = prepareTurn(input.request, {
-      resumeFromIndex: input.resumeFromIndex,
-    });
+    // Planning happens under the conversation lock, so a concurrent request
+    // cannot reuse a plan computed against an older committed history.
+    const plan = input.plan ? input.plan() : null;
+    const resumeSessionId = plan?.sessionId ?? input.resumeSessionId;
+    const resumeFromIndex = plan?.fromIndex ?? input.resumeFromIndex;
+    let prepared = prepareTurn(input.request, { resumeFromIndex });
     let launchKey = this.launchKey(input.request, prepared);
     let state = this.processes.get(input.conversationKey);
 
     if (state) {
       const sameSession =
-        !input.resumeSessionId || !state.sessionId || state.sessionId === input.resumeSessionId;
+        !resumeSessionId || !state.sessionId || state.sessionId === resumeSessionId;
       const compatible =
         !state.closed &&
         state.launchKey === launchKey &&
-        input.resumeFromIndex !== undefined &&
+        resumeFromIndex !== undefined &&
         sameSession;
       if (!compatible) {
         this.closeState(state, "Session configuration or history changed");
@@ -274,14 +294,23 @@ export class ClaudeRunner {
         state.pending.beginPhase();
         state.input.push({ ...prepared.prompt, uuid: randomUUID() } as SDKUserMessage);
         const result = await this.consume(state, { ...input, resumeSessionId: undefined });
-        return { ...result, reused: true };
+        const finished = { ...result, reused: true };
+        input.record?.(finished);
+        return finished;
       }
-      return await this.startProcess(input, prepared, launchKey);
+      const result = await this.startProcess(
+        { ...input, resumeSessionId, resumeFromIndex },
+        prepared,
+        launchKey,
+      );
+      if (resumeSessionId !== undefined) result.resumed = true;
+      input.record?.(result);
+      return result;
     } catch (error) {
       if (error instanceof ResumeFailed) {
         this.logger.warn("Claude session could not be resumed; replaying history", {
           requestId: input.requestId,
-          sessionId: input.resumeSessionId,
+          sessionId: resumeSessionId,
         });
         const fresh = {
           ...input,
@@ -290,7 +319,9 @@ export class ClaudeRunner {
         };
         prepared = prepareTurn(input.request);
         launchKey = this.launchKey(input.request, prepared);
-        return this.startProcess(fresh, prepared, launchKey);
+        const result = await this.startProcess(fresh, prepared, launchKey);
+        input.record?.(result);
+        return result;
       }
       throw error;
     }
@@ -451,23 +482,6 @@ export class ClaudeRunner {
     }
   }
 
-  private async withLock<T>(key: string, run: () => Promise<T>): Promise<T> {
-    const previous = this.locks.get(key) ?? Promise.resolve();
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const tail = previous.then(() => gate);
-    this.locks.set(key, tail);
-    await previous;
-    try {
-      return await run();
-    } finally {
-      release();
-      if (this.locks.get(key) === tail) this.locks.delete(key);
-    }
-  }
-
   private cancelIdle(state: TurnState): void {
     if (!state.idleTimer) return;
     clearTimeout(state.idleTimer);
@@ -493,6 +507,10 @@ export class ClaudeRunner {
   }
 
   private async consume(state: TurnState, input: RunInput): Promise<RunResult> {
+    if (input.signal.aborted) {
+      this.closeState(state, "Client aborted");
+      throw new ClientAbort();
+    }
     const assembler = new MessageAssembler(
       state.model,
       state.bridge,
@@ -584,19 +602,33 @@ export class ClaudeRunner {
     state.busy = false;
     state.lastUsed = Date.now();
     if (ended) this.closeState(state, "Claude process ended");
-    else this.armIdle(state);
+    else if (this.limit.waiting > 0) {
+      this.closeState(state, "Yielded capacity to a waiting conversation");
+    } else this.armIdle(state);
     return { response, sessionId: state.sessionId };
   }
 
   private makeParked(state: TurnState): ParkedTurn {
     return new ParkedTurn(randomUUID(), state.sessionId, state.pending, {
-      resume: (input) =>
-        this.withLock(state.key, () => this.resumeParked(state, input)),
+      resume: async (input) => {
+        let release: (() => void) | undefined;
+        try {
+          release = await this.locks.acquire(state.key, input.signal);
+        } catch {
+          throw new ClientAbort();
+        }
+        try {
+          return await this.resumeParked(state, input);
+        } finally {
+          release();
+        }
+      },
       close: (reason) => this.closeState(state, reason),
     });
   }
 
   private async resumeParked(state: TurnState, input: ResumeParkedInput): Promise<RunResult> {
+    if (input.signal.aborted) throw new ClientAbort();
     const ids = state.pending.pendingIds();
     for (const id of ids) {
       if (!input.toolResults.has(id)) {
@@ -611,7 +643,9 @@ export class ClaudeRunner {
     state.pending.beginPhase();
     try {
       const result = await this.consume(state, { ...input, resumeSessionId: undefined });
-      return { ...result, reused: true };
+      const finished = { ...result, reused: true };
+      input.record?.(finished);
+      return finished;
     } catch (error) {
       this.closeState(state, "Tool continuation failed");
       throw error;

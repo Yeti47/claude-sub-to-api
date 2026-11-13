@@ -134,21 +134,26 @@ export function createHandler(deps: Deps) {
     );
     const hashes = userMessageHashes(request.messages);
     const promptHash = systemHash(systemText(request.system) ?? null);
-    const plan = deps.sessions.plan({
-      key,
-      messages: request.messages,
-      model: request.model,
-      cwd: config.cwd,
-      systemHash: promptHash,
-      now: Date.now(),
-    });
-    if (plan) {
-      logger.debug("resuming Claude session", {
-        requestId,
-        sessionId: plan.sessionId,
-        matchedUsers: plan.matchedUsers,
+    const plan = () =>
+      deps.sessions.plan({
+        key,
+        messages: request.messages,
+        model: request.model,
+        cwd: config.cwd,
+        systemHash: promptHash,
+        now: Date.now(),
       });
-    }
+    const record = (result: RunResult) => {
+      if (!result.sessionId) return;
+      deps.sessions.record({
+        key,
+        sessionId: result.sessionId,
+        model: request.model,
+        cwd: config.cwd,
+        systemHash: promptHash,
+        userHashes: hashes,
+      });
+    };
 
     try {
       const toolResults = lastToolResults(request.messages);
@@ -166,7 +171,6 @@ export function createHandler(deps: Deps) {
         }
       }
       let result: RunResult;
-      let parkedResumed = false;
 
       if (parked) {
         const missing = parked.pendingIds().filter((id) => !toolResults.results.has(id));
@@ -177,18 +181,26 @@ export function createHandler(deps: Deps) {
             `missing tool_result for ${missing.join(", ")}`,
           );
         }
+        if (controller.signal.aborted) return;
         deps.parked.remove(parked);
-        parkedResumed = true;
-        result = await parked.resume({
-          conversationKey: key,
-          request,
-          signal: controller.signal,
-          requestId,
-          stream,
-          onEvent: writer ? (event) => writer!.event(event) : undefined,
-          toolResults: toolResults.results,
-          steeringText: toolResults.steeringText,
-        });
+        try {
+          result = await parked.resume({
+            conversationKey: key,
+            request,
+            signal: controller.signal,
+            requestId,
+            stream,
+            onEvent: writer ? (event) => writer!.event(event) : undefined,
+            toolResults: toolResults.results,
+            steeringText: toolResults.steeringText,
+            record,
+          });
+        } catch (error) {
+          if (error instanceof ClientAbort && parked.pendingIds().length > 0) {
+            deps.parked.add(key, parked);
+          }
+          throw error;
+        }
         if (result.parked) deps.parked.add(key, result.parked);
       } else {
         deps.parked.close(key, "Superseded by a new request");
@@ -199,24 +211,14 @@ export function createHandler(deps: Deps) {
           requestId,
           stream,
           onEvent: writer ? (event) => writer!.event(event) : undefined,
-          resumeSessionId: plan?.sessionId,
-          resumeFromIndex: plan?.fromIndex,
           persistSession: true,
+          plan,
+          record,
         });
         if (result.parked) deps.parked.add(key, result.parked);
       }
 
       const response = result.response;
-      if (result.sessionId) {
-        deps.sessions.record({
-          key,
-          sessionId: result.sessionId,
-          model: request.model,
-          cwd: config.cwd,
-          systemHash: promptHash,
-          userHashes: hashes,
-        });
-      }
       if (writer) {
         writer.finish();
       } else {
@@ -228,7 +230,7 @@ export function createHandler(deps: Deps) {
         model: request.model,
         stream,
         status: 200,
-        resumed: Boolean(plan) || parkedResumed,
+        resumed: Boolean(result.resumed),
         reused: Boolean(result.reused),
         parked: Boolean(result.parked),
         sessionId: result.sessionId,
