@@ -181,7 +181,7 @@ export function createHandler(deps: Deps) {
             `missing tool_result for ${missing.join(", ")}`,
           );
         }
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted) throw new ClientAbort();
         deps.parked.remove(parked);
         try {
           result = await parked.resume({
