@@ -1,6 +1,13 @@
 import type { ServerResponse } from "node:http";
 
-/** Writes Anthropic-style server-sent events and keeps the connection warm. */
+/**
+ * Writes Anthropic-style server-sent events and keeps the connection warm.
+ *
+ * The response is not committed until the first event. A turn that fails
+ * before producing one (rate limit, authentication, no capacity) can still
+ * be answered with a real HTTP status, which is what client SDKs base their
+ * retry and backoff on.
+ */
 export class SseWriter {
   private heartbeat: ReturnType<typeof setInterval> | undefined;
   private closed = false;
@@ -8,20 +15,28 @@ export class SseWriter {
 
   constructor(
     private readonly res: ServerResponse,
-    heartbeatMs = 15_000,
-  ) {
-    res.writeHead(200, {
+    private readonly heartbeatMs = 15_000,
+  ) {}
+
+  /** Whether the 200 status and stream headers were sent. */
+  get started(): boolean {
+    return this.res.headersSent;
+  }
+
+  private start(): void {
+    this.res.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-cache, no-transform",
       connection: "keep-alive",
       "x-accel-buffering": "no",
     });
-    this.heartbeat = setInterval(() => this.event({ type: "ping" }), heartbeatMs);
+    this.heartbeat = setInterval(() => this.event({ type: "ping" }), this.heartbeatMs);
     this.heartbeat.unref?.();
   }
 
   event(payload: Record<string, unknown>): void {
     if (this.closed) return;
+    if (!this.started) this.start();
     const type = typeof payload.type === "string" ? payload.type : "message";
     this.lastType = type;
     this.res.write(`event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`);
@@ -33,6 +48,7 @@ export class SseWriter {
     this.end();
   }
 
+  /** Report a failure inside a stream that has already started. */
   error(status: number, type: string, message: string): void {
     this.event({ type: "error", error: { type, message }, status });
   }

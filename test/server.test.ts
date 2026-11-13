@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { ApiError } from "../src/claude/errors.js";
 import { createHandler } from "../src/http/server.js";
 import { createLogger } from "../src/logger.js";
 import type { Config } from "../src/config.js";
@@ -204,4 +205,54 @@ test("plans a resume for an appended turn and a fork for a rewritten one", async
     assert.equal(plans[2].upToMessageId, "leaf-1");
     assert.equal(plans[2].fromIndex, 2);
   }
+});
+
+test("a stream that fails before its first event gets the real HTTP status", async () => {
+  await withServer(
+    async (base) => {
+      const res = await fetch(`${base}/v1/messages`, {
+        method: "POST",
+        headers: { "x-api-key": "secret", "content-type": "application/json" },
+        body: JSON.stringify({ ...JSON.parse(body), stream: true }),
+      });
+      assert.equal(res.status, 429);
+      assert.equal(res.headers.get("retry-after"), "120");
+      assert.match(res.headers.get("content-type") ?? "", /application\/json/);
+      const json = (await res.json()) as { type: string; error: { type: string; message: string } };
+      assert.equal(json.type, "error");
+      assert.equal(json.error.type, "rate_limit_error");
+    },
+    {
+      runner: {
+        run: async () => {
+          throw new ApiError(429, "rate_limit_error", "limit reached", 120);
+        },
+      } as never,
+    },
+  );
+});
+
+test("a stream that fails after it started reports the error as an event", async () => {
+  await withServer(
+    async (base) => {
+      const res = await fetch(`${base}/v1/messages`, {
+        method: "POST",
+        headers: { "x-api-key": "secret", "content-type": "application/json" },
+        body: JSON.stringify({ ...JSON.parse(body), stream: true }),
+      });
+      assert.equal(res.status, 200);
+      const text = await res.text();
+      assert.match(text, /event: message_start/);
+      assert.match(text, /event: error\ndata: .*overloaded_error/);
+      assert.doesNotMatch(text, /event: message_stop/);
+    },
+    {
+      runner: {
+        run: async (input: { onEvent?: (event: Record<string, unknown>) => void }) => {
+          input.onEvent?.({ type: "message_start", message: { id: "msg_1" } });
+          throw new ApiError(529, "overloaded_error", "overloaded");
+        },
+      } as never,
+    },
+  );
 });

@@ -191,14 +191,11 @@ export function createHandler(deps: Deps) {
         if (timedOut) {
           const message = `Request exceeded ${config.requestTimeoutMs} ms`;
           logger.error("request timed out", { requestId, model: request.model });
-          if (writer) {
-            writer.error(504, "api_error", message);
-            writer.end();
-          } else if (!res.headersSent) {
-            sendError(res, 504, "api_error", message);
-          }
+          fail(res, writer, new ApiError(504, "api_error", message));
+        } else if (writer) {
+          writer.end();
         } else {
-          writer?.end();
+          res.end();
         }
         return;
       }
@@ -211,14 +208,7 @@ export function createHandler(deps: Deps) {
         error: apiError.message,
         ms: Date.now() - started,
       });
-      if (writer) {
-        writer.error(apiError.status, apiError.type, apiError.message);
-        writer.end();
-      } else if (!res.headersSent) {
-        sendError(res, apiError.status, apiError.type, apiError.message);
-      } else {
-        res.end();
-      }
+      fail(res, writer, apiError);
     } finally {
       clearTimeout(timer);
     }
@@ -276,16 +266,31 @@ function readJson(req: IncomingMessage): Promise<unknown> {
   });
 }
 
+/**
+ * Answer a failed request. A stream that already started can only carry the
+ * failure as an `error` event; everything else gets the real HTTP status.
+ */
+function fail(res: ServerResponse, writer: SseWriter | undefined, error: ApiError): void {
+  if (writer?.started) {
+    writer.error(error.status, error.type, error.message);
+    writer.end();
+    return;
+  }
+  sendError(res, error.status, error.type, error.message, error.retryAfter);
+}
+
 function sendError(
   res: ServerResponse,
   status: number,
   type: string,
   message: string,
+  retryAfter?: number,
 ): void {
   if (res.headersSent) {
     res.end();
     return;
   }
+  if (retryAfter !== undefined) res.setHeader("retry-after", String(retryAfter));
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify({ type: "error", error: { type, message } }));
 }
