@@ -872,22 +872,29 @@ test("releases a claimed session when its turn fails, and forgets a missing one"
   );
   assert.deepEqual(released, [decision]);
 
+  // Only a fork that failed because the transcript is gone drops the source.
   const forgotten: string[] = [];
-  const forking = new ClaudeRunner(
-    config,
-    createLogger("error"),
-    fakeQuery(textEvents) as never,
-    undefined,
-    (() => Promise.reject(new Error("transcript missing"))) as never,
-  );
-  await forking.run({
-    conversationKey: "conv",
-    request: { model: "m", messages: [{ role: "user", content: "hi" }] },
-    signal: new AbortController().signal,
-    requestId: "forget",
-    stream: false,
-    plan: () => ({ kind: "fork", sessionId: "gone", upToMessageId: "leaf", fromIndex: 0 }),
-    forget: (sessionId) => forgotten.push(sessionId),
-  });
+  for (const [sessionId, message] of [
+    ["gone", "Session gone not found in project directory for /tmp"],
+    ["healthy", "ENOSPC: no space left on device, write"],
+  ]) {
+    const forking = new ClaudeRunner(
+      config,
+      createLogger("error"),
+      fakeQuery(textEvents) as never,
+      undefined,
+      (() => Promise.reject(new Error(message))) as never,
+    );
+    const result = await forking.run({
+      conversationKey: "conv",
+      request: { model: "m", messages: [{ role: "user", content: "hi" }] },
+      signal: new AbortController().signal,
+      requestId: "forget",
+      stream: false,
+      plan: () => ({ kind: "fork", sessionId: sessionId!, upToMessageId: "leaf", fromIndex: 0 }),
+      forget: (id) => forgotten.push(id),
+    });
+    assert.equal(result.forked, undefined);
+  }
   assert.deepEqual(forgotten, ["gone"]);
 });

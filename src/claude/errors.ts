@@ -30,6 +30,12 @@ export function isMissingSession(error: unknown): boolean {
   );
 }
 
+/** Whether a failed fork means the source transcript or checkpoint is gone. */
+export function isMissingTranscript(error: unknown): boolean {
+  if ((error as { code?: unknown } | null)?.code === "ENOENT") return true;
+  return /not found|no messages to fork|ENOENT/i.test(errorMessage(error));
+}
+
 export function errorFor(result: {
   type: string;
   message: string;

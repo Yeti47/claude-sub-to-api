@@ -39,7 +39,8 @@ export interface LiveProcessInit {
 }
 
 export class LiveProcess {
-  readonly key: string;
+  /** Conversation key of the request this process last served. */
+  key: string;
   readonly model: string;
   readonly launchKey: string;
   readonly includeThinking: boolean;
