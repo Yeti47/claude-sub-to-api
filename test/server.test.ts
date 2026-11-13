@@ -6,8 +6,9 @@ import { createHandler } from "../src/http/server.js";
 import { createLogger } from "../src/logger.js";
 import type { Config } from "../src/config.js";
 import type { MessagesResponse } from "../src/anthropic/types.js";
-import { SessionStore } from "../src/session/store.js";
+import { SessionStore, type ResumeDecision } from "../src/session/store.js";
 import { ParkedTurnStore } from "../src/claude/parked.js";
+import type { RunResult } from "../src/claude/runner.js";
 
 const config: Config = {
   listenAddr: ":0",
@@ -34,7 +35,10 @@ const response: MessagesResponse = {
   usage: { input_tokens: 3, output_tokens: 1 },
 };
 
-async function withServer(run: (base: string) => Promise<void>): Promise<void> {
+async function withServer(
+  run: (base: string) => Promise<void>,
+  overrides: Partial<Parameters<typeof createHandler>[0]> = {},
+): Promise<void> {
   const handler = createHandler({
     config,
     logger: createLogger("error"),
@@ -53,6 +57,7 @@ async function withServer(run: (base: string) => Promise<void>): Promise<void> {
     auth: { status: async () => ({ ok: true, detail: "test" }), cleanup: async () => {} },
     sessions: new SessionStore(undefined, createLogger("error")),
     parked: new ParkedTurnStore(createLogger("error"), 0),
+    ...overrides,
   });
   const server = createServer((req, res) => void handler(req, res));
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -137,4 +142,68 @@ test("lists models for an authorized caller", async () => {
     const json = (await res.json()) as { data: Array<{ id: string }> };
     assert.equal(json.data[0]?.id, "claude-sonnet-5-5");
   });
+});
+
+test("plans a resume for an appended turn and a fork for a rewritten one", async () => {
+  const sessions = new SessionStore(undefined, createLogger("error"));
+  const plans: ResumeDecision[] = [];
+  const runner = {
+    run: async (input: {
+      plan?: () => ResumeDecision;
+      record?: (result: RunResult, decision?: ResumeDecision) => void;
+    }) => {
+      const decision = input.plan?.() ?? { kind: "fresh" };
+      plans.push(decision);
+      const result: RunResult = { response, sessionId: "session-test", leafUuid: "leaf-1" };
+      input.record?.(result, decision);
+      return result;
+    },
+  };
+
+  await withServer(
+    async (base) => {
+      const send = (messages: unknown[]) =>
+        fetch(`${base}/v1/messages`, {
+          method: "POST",
+          headers: {
+            "x-api-key": "secret",
+            "x-session-id": "record-1",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ model: "claude-sonnet-5-5", max_tokens: 10, messages }),
+        });
+
+      assert.equal((await send([{ role: "user", content: "hi" }])).status, 200);
+      assert.equal(
+        (
+          await send([
+            { role: "user", content: "hi" },
+            { role: "assistant", content: "hello" },
+            { role: "user", content: "again" },
+          ])
+        ).status,
+        200,
+      );
+      assert.equal(
+        (
+          await send([
+            { role: "user", content: "hi" },
+            { role: "assistant", content: "hello" },
+            { role: "user", content: "edited" },
+          ])
+        ).status,
+        200,
+      );
+    },
+    { runner: runner as never, sessions },
+  );
+
+  assert.equal(plans[0]?.kind, "fresh");
+  assert.equal(plans[1]?.kind, "resume");
+  assert.equal(plans[2]?.kind, "fork");
+  if (plans[2]?.kind === "fork") {
+    assert.equal(plans[2].sessionId, "session-test");
+    assert.equal(plans[2].upToMessageId, "leaf-1");
+    assert.equal(plans[2].fromIndex, 2);
+  }
 });

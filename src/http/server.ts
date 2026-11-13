@@ -8,7 +8,7 @@ import type { Message, MessagesRequest, ToolResultBlock } from "../anthropic/typ
 import { contentBlocks, systemText } from "../anthropic/translate.js";
 import { ApiError, ClientAbort, ClaudeRunner, type RunResult } from "../claude/runner.js";
 import type { ModelCatalog } from "../claude/models.js";
-import type { SessionStore } from "../session/store.js";
+import type { SessionStore, ResumeDecision } from "../session/store.js";
 import type { ParkedTurnStore } from "../claude/parked.js";
 import { deriveConversationKey, systemHash, userMessageHashes } from "../session/hashes.js";
 import { SseWriter } from "./sse.js";
@@ -143,7 +143,7 @@ export function createHandler(deps: Deps) {
         systemHash: promptHash,
         now: Date.now(),
       });
-    const record = (result: RunResult) => {
+    const record = (result: RunResult, decision?: ResumeDecision) => {
       if (!result.sessionId) return;
       deps.sessions.record({
         key,
@@ -152,6 +152,9 @@ export function createHandler(deps: Deps) {
         cwd: config.cwd,
         systemHash: promptHash,
         userHashes: hashes,
+        leafUuid: result.leafUuid,
+        parked: Boolean(result.parked),
+        decision,
       });
     };
 
@@ -231,6 +234,7 @@ export function createHandler(deps: Deps) {
         stream,
         status: 200,
         resumed: Boolean(result.resumed),
+        forked: Boolean(result.forked),
         reused: Boolean(result.reused),
         parked: Boolean(result.parked),
         sessionId: result.sessionId,

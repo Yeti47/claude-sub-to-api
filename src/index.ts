@@ -22,6 +22,12 @@ function listenOptions(addr: string): { host?: string; port: number } {
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  // forkSession() runs in this process (not the CLI child) and locates session
+  // transcripts through CLAUDE_CONFIG_DIR. Point it at the same directory the
+  // runner passes to the CLI.
+  if (config.claudeConfigDirExplicit) {
+    process.env.CLAUDE_CONFIG_DIR = config.claudeConfigDir;
+  }
   const logger = createLogger(config.logLevel);
   const auth = await prepareClaudeAuth(config, logger);
   try {

@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ClaudeRunner, ApiError, ClientAbort } from "../src/claude/runner.js";
+import { ClaudeRunner, ApiError, ClientAbort, type RunResult } from "../src/claude/runner.js";
 import { PendingToolRegistry } from "../src/claude/pending-tools.js";
 import { createLogger } from "../src/logger.js";
 import type { Config } from "../src/config.js";
+import type { ResumeDecision } from "../src/session/store.js";
 
 const config: Config = {
   listenAddr: ":0",
@@ -165,7 +166,7 @@ test("reuses one live process for consecutive turns", async () => {
     stream: false,
     plan: () => {
       planned += 1;
-      return { sessionId: "session-1", fromIndex: 2 };
+      return { kind: "resume", sessionId: "session-1", fromIndex: 2, matchedUsers: 1 };
     },
     record: () => {
       recorded += 1;
@@ -225,6 +226,195 @@ test("closes an idle process and resumes its session on the next turn", async ()
   assert.equal(counter.calls, 2);
   assert.equal(secondOptions?.resume, "session-1");
   assert.deepEqual(received, ["one", "two"]);
+  runner.closeAll();
+});
+
+test("forks at a checkpoint and resumes the forked session", async () => {
+  let options: Record<string, unknown> | undefined;
+  let forkArgs: unknown[] | undefined;
+  let recorded: { result: RunResult; decision?: ResumeDecision } | undefined;
+  const runner = new ClaudeRunner(
+    config,
+    createLogger("error"),
+    ((params: { options: Record<string, unknown> }) => {
+      options = params.options;
+      return {
+        async *[Symbol.asyncIterator]() {
+          yield { type: "stream_event", event: { type: "message_start", message: { id: "msg_1", session_id: "fork-1", usage: { input_tokens: 1 } } } };
+          yield { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } };
+          yield { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } } };
+          yield { type: "stream_event", event: { type: "content_block_stop", index: 0 } };
+          yield { type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } } };
+          yield { type: "stream_event", event: { type: "message_stop" } };
+          yield {
+            type: "assistant",
+            uuid: "leaf-9",
+            parent_tool_use_id: null,
+            session_id: "fork-1",
+            message: { id: "msg_1", content: [{ type: "text", text: "ok" }], usage: {} },
+          };
+          yield { type: "result", subtype: "success", is_error: false, result: "ok", stop_reason: "end_turn", usage: { input_tokens: 1, output_tokens: 1 } };
+        },
+        close() {},
+      };
+    }) as never,
+    undefined,
+    ((...args: unknown[]) => {
+      forkArgs = args;
+      return Promise.resolve({ sessionId: "fork-1" });
+    }) as never,
+  );
+
+  const result = await runner.run({
+    conversationKey: "conv",
+    request: {
+      model: "claude-sonnet-5-5",
+      messages: [
+        { role: "user", content: "one" },
+        { role: "assistant", content: "reply" },
+        { role: "user", content: "edited" },
+      ],
+    },
+    signal: new AbortController().signal,
+    requestId: "fork-1",
+    stream: false,
+    plan: () => ({
+      kind: "fork",
+      sessionId: "session-1",
+      upToMessageId: "leaf-1",
+      fromIndex: 2,
+      matchedUsers: 1,
+    }),
+    record: (value, decision) => {
+      recorded = { result: value, decision };
+    },
+  });
+
+  assert.deepEqual(forkArgs, ["session-1", { upToMessageId: "leaf-1", dir: config.cwd }]);
+  assert.equal(options?.resume, "fork-1");
+  assert.equal(result.forked, true);
+  assert.equal(result.resumed, true);
+  assert.equal(result.sessionId, "fork-1");
+  assert.equal(result.leafUuid, "leaf-9");
+  assert.equal(recorded?.decision?.kind, "fork");
+  assert.equal(recorded?.result.leafUuid, "leaf-9");
+  runner.closeAll();
+});
+
+test("replays history in a fresh session when forking fails", async () => {
+  let options: Record<string, unknown> | undefined;
+  let decision: ResumeDecision | undefined;
+  const runner = new ClaudeRunner(
+    config,
+    createLogger("error"),
+    fakeQuery(textEvents, (value) => (options = value)) as never,
+    undefined,
+    (() => Promise.reject(new Error("transcript missing"))) as never,
+  );
+
+  const result = await runner.run({
+    conversationKey: "conv",
+    request: {
+      model: "claude-sonnet-5-5",
+      messages: [
+        { role: "user", content: "one" },
+        { role: "assistant", content: "reply" },
+        { role: "user", content: "edited" },
+      ],
+    },
+    signal: new AbortController().signal,
+    requestId: "fork-fail",
+    stream: false,
+    plan: () => ({
+      kind: "fork",
+      sessionId: "session-1",
+      upToMessageId: "leaf-1",
+      fromIndex: 2,
+      matchedUsers: 1,
+    }),
+    record: (_result, value) => {
+      decision = value;
+    },
+  });
+
+  assert.equal(options?.resume, undefined);
+  assert.equal(result.forked, undefined);
+  assert.equal(result.resumed, undefined);
+  assert.equal(decision?.kind, "fresh");
+  runner.closeAll();
+});
+
+test("does not fork when the plan resumes", async () => {
+  let forks = 0;
+  const runner = new ClaudeRunner(
+    config,
+    createLogger("error"),
+    fakeQuery(textEvents) as never,
+    undefined,
+    (() => {
+      forks += 1;
+      return Promise.resolve({ sessionId: "fork-1" });
+    }) as never,
+  );
+
+  await runner.run({
+    conversationKey: "conv",
+    request: {
+      model: "claude-sonnet-5-5",
+      messages: [
+        { role: "user", content: "one" },
+        { role: "assistant", content: "reply" },
+        { role: "user", content: "two" },
+      ],
+    },
+    signal: new AbortController().signal,
+    requestId: "resume-only",
+    stream: false,
+    plan: () => ({ kind: "resume", sessionId: "session-1", fromIndex: 2, matchedUsers: 1 }),
+  });
+
+  assert.equal(forks, 0);
+  runner.closeAll();
+});
+
+test("replays history when a resumed session no longer exists", async () => {
+  let calls = 0;
+  let secondOptions: Record<string, unknown> | undefined;
+  const queryFn = (params: { options: Record<string, unknown> }) => {
+    const call = ++calls;
+    if (call === 2) secondOptions = params.options;
+    return {
+      async *[Symbol.asyncIterator]() {
+        if (call === 1) {
+          yield {
+            type: "result",
+            subtype: "error_during_execution",
+            is_error: true,
+            errors: ["No conversation found with session ID: session-1"],
+            stop_reason: null,
+            usage: {},
+          };
+          return;
+        }
+        for (const event of textEvents) yield event;
+      },
+      close() {},
+    };
+  };
+  const runner = new ClaudeRunner(config, createLogger("error"), queryFn as never);
+
+  const result = await runner.run({
+    conversationKey: "conv",
+    request: { model: "claude-sonnet-5-5", messages: [{ role: "user", content: "hi" }] },
+    signal: new AbortController().signal,
+    requestId: "missing-session",
+    stream: false,
+    plan: () => ({ kind: "resume", sessionId: "session-1", fromIndex: 0, matchedUsers: 0 }),
+  });
+
+  assert.equal(calls, 2);
+  assert.equal(secondOptions?.resume, undefined);
+  assert.equal(result.response.content[0]?.type, "text");
   runner.closeAll();
 });
 
@@ -421,6 +611,7 @@ test("parks a tool_use turn and resumes it with the client result", async () => 
     () => (pending = new PendingToolRegistry()),
   );
   const streamed: string[] = [];
+  let parkedRecord: RunResult | undefined;
   const first = await runner.run({
     request: {
       model: "claude-sonnet-5-5",
@@ -432,9 +623,14 @@ test("parks a tool_use turn and resumes it with the client result", async () => 
     requestId: "r2",
     stream: true,
     onEvent: (event) => streamed.push(String(event.type)),
+    record: (value) => {
+      parkedRecord = value;
+    },
   });
 
   assert.ok(first.parked);
+  assert.ok(parkedRecord?.parked);
+  assert.equal(parkedRecord?.leafUuid, undefined);
   assert.equal(pending!.calls()[0]?.toolUseId, "t1");
   assert.equal(first.response.stop_reason, "tool_use");
   assert.deepEqual(first.response.content[0], {

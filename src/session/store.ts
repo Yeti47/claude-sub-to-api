@@ -2,8 +2,10 @@
  * Persisted conversation -> Claude session bindings.
  *
  * Resuming the same Claude session is what keeps Anthropic's prompt cache
- * warm: the CLI sends the new user message on top of the exact transcript it
- * already has, instead of re-sending a reconstructed history.
+ * warm. Each completed turn also records a checkpoint: the user-message count
+ * and the Claude transcript UUID at the end of that turn. When the client
+ * rewinds or edits history, the session is forked at the latest matching
+ * checkpoint instead of being discarded.
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
@@ -11,26 +13,57 @@ import type { Message } from "../anthropic/types.js";
 import { hasToolResult, userMessageHashes } from "./hashes.js";
 import type { Logger } from "../logger.js";
 
+export interface Checkpoint {
+  /** Number of user messages the session had answered at this point. */
+  count: number;
+  /** Hash of the last user message in that turn. */
+  hash: string;
+  /** Claude session containing this checkpoint. */
+  sessionId: string;
+  /** Transcript UUID at the end of the turn. */
+  leafUuid: string;
+}
+
 interface Binding {
   sessionId: string;
   model: string;
   cwd: string;
   systemHash: string;
   userHashes: string[];
+  checkpoints?: Checkpoint[];
   updatedAt: number;
 }
 
-export interface ResumePlan {
-  sessionId: string;
-  /** Index in the request's messages where the session's new turns start. */
-  fromIndex: number;
-  /** How many user messages the session has already answered. */
-  matchedUsers: number;
-}
+export type ResumeDecision =
+  | {
+      kind: "resume";
+      sessionId: string;
+      fromIndex: number;
+      matchedUsers: number;
+    }
+  | {
+      kind: "fork";
+      sessionId: string;
+      upToMessageId: string;
+      fromIndex: number;
+      matchedUsers: number;
+    }
+  | { kind: "fresh" };
 
 const MAX_BINDINGS = 300;
 const MAX_HASHES = 500;
+const MAX_CHECKPOINTS = 100;
 const MAX_AGE_MS = 30 * 24 * 60 * 60_000;
+
+function fromIndexFor(messages: Message[], matchedUsers: number): number {
+  let seen = 0;
+  for (let index = 0; index < messages.length; index += 1) {
+    if (messages[index]?.role !== "user") continue;
+    seen += 1;
+    if (seen === matchedUsers + 1) return index;
+  }
+  return -1;
+}
 
 export class SessionStore {
   private data: Record<string, Binding> = {};
@@ -69,12 +102,6 @@ export class SessionStore {
     }
   }
 
-  /**
-   * Decide whether this request continues the bound session. Returns null
-   * when the history diverged, the model/prompt changed, this is a retry with
-   * no new user turn, or the new turn is a tool result (handled by the tool
-   * bridge rather than a resume).
-   */
   plan(input: {
     key: string;
     messages: Message[];
@@ -82,49 +109,77 @@ export class SessionStore {
     cwd: string;
     systemHash: string;
     now?: number;
-  }): ResumePlan | null {
+  }): ResumeDecision {
     const binding = this.data[input.key];
-    if (!binding) return null;
+    if (!binding) return { kind: "fresh" };
     if (input.now !== undefined && input.now - binding.updatedAt > MAX_AGE_MS) {
       delete this.data[input.key];
       this.dirty = true;
-      return null;
+      return { kind: "fresh" };
     }
     if (
       binding.model !== input.model ||
       binding.cwd !== input.cwd ||
       binding.systemHash !== input.systemHash
     ) {
-      return null;
+      return { kind: "fresh" };
     }
 
     const hashes = userMessageHashes(input.messages);
-    if (hashes.length <= binding.userHashes.length) return null;
-    for (let index = 0; index < binding.userHashes.length; index += 1) {
-      if (hashes[index] !== binding.userHashes[index]) return null;
-    }
+    if (hashes.length === 0) return { kind: "fresh" };
 
-    // Find where the session's first new user message begins.
-    let seen = 0;
-    let fromIndex = -1;
-    for (let index = 0; index < input.messages.length; index += 1) {
-      if (input.messages[index]?.role !== "user") continue;
-      seen += 1;
-      if (seen === binding.userHashes.length + 1) {
-        fromIndex = index;
-        break;
+    const matches = (count: number): boolean => {
+      if (count === 0) return true;
+      if (binding.userHashes.length < count || hashes.length < count) return false;
+      for (let index = 0; index < count; index += 1) {
+        if (binding.userHashes[index] !== hashes[index]) return false;
+      }
+      return true;
+    };
+
+    // The normal case: the client appended a new turn to the bound history.
+    if (
+      hashes.length > binding.userHashes.length &&
+      matches(binding.userHashes.length)
+    ) {
+      const fromIndex = fromIndexFor(input.messages, binding.userHashes.length);
+      if (fromIndex >= 0 && !input.messages.slice(fromIndex).some(hasToolResult)) {
+        return {
+          kind: "resume",
+          sessionId: binding.sessionId,
+          fromIndex,
+          matchedUsers: binding.userHashes.length,
+        };
       }
     }
-    if (fromIndex < 0) return null;
 
-    const newTurns = input.messages.slice(fromIndex);
-    if (newTurns.some(hasToolResult)) return null;
+    // A rewrite, rewind or retry: fork at the last checkpoint that still
+    // matches the incoming history, then send the remaining turns.
+    const target = hashes.length - 1;
+    if (target >= 0) {
+      const checkpoints = [...(binding.checkpoints ?? [])]
+        .filter(
+          (checkpoint) =>
+            checkpoint.count <= target &&
+            checkpoint.leafUuid.length > 0 &&
+            checkpoint.sessionId.length > 0 &&
+            matches(checkpoint.count),
+        )
+        .sort((a, b) => b.count - a.count);
+      for (const checkpoint of checkpoints) {
+        const fromIndex = fromIndexFor(input.messages, checkpoint.count);
+        if (fromIndex < 0) continue;
+        return {
+          kind: "fork",
+          sessionId: checkpoint.sessionId,
+          upToMessageId: checkpoint.leafUuid,
+          fromIndex,
+          matchedUsers: checkpoint.count,
+        };
+      }
+    }
 
-    return {
-      sessionId: binding.sessionId,
-      fromIndex,
-      matchedUsers: binding.userHashes.length,
-    };
+    return { kind: "fresh" };
   }
 
   record(input: {
@@ -134,14 +189,49 @@ export class SessionStore {
     cwd: string;
     systemHash: string;
     userHashes: string[];
+    /** Transcript UUID of the final assistant message of this turn. */
+    leafUuid?: string;
+    /** A tool turn is not a completed checkpoint yet. */
+    parked?: boolean;
+    /** Decision that started this turn, for checkpoint retention. */
+    decision?: ResumeDecision | null;
   }): void {
     if (input.userHashes.length > MAX_HASHES) return;
+    const existing = this.data[input.key];
+    const decision = input.decision;
+    let checkpoints: Checkpoint[];
+    if (decision?.kind === "fresh") {
+      checkpoints = [];
+    } else if (decision?.kind === "fork") {
+      checkpoints = (existing?.checkpoints ?? []).filter(
+        (checkpoint) => checkpoint.count <= decision.matchedUsers,
+      );
+    } else {
+      checkpoints = [...(existing?.checkpoints ?? [])];
+    }
+
+    if (!input.parked && input.leafUuid && input.userHashes.length > 0) {
+      const checkpoint: Checkpoint = {
+        count: input.userHashes.length,
+        hash: input.userHashes[input.userHashes.length - 1]!,
+        sessionId: input.sessionId,
+        leafUuid: input.leafUuid,
+      };
+      checkpoints = checkpoints.filter((item) => item.count !== checkpoint.count);
+      checkpoints.push(checkpoint);
+      checkpoints.sort((a, b) => a.count - b.count);
+      if (checkpoints.length > MAX_CHECKPOINTS) {
+        checkpoints = checkpoints.slice(-MAX_CHECKPOINTS);
+      }
+    }
+
     this.data[input.key] = {
       sessionId: input.sessionId,
       model: input.model,
       cwd: input.cwd,
       systemHash: input.systemHash,
       userHashes: input.userHashes,
+      ...(checkpoints.length > 0 ? { checkpoints } : {}),
       updatedAt: Date.now(),
     };
     this.prune();
