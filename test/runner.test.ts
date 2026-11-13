@@ -4,7 +4,7 @@ import { ClaudeRunner, ApiError, ClientAbort, type RunResult } from "../src/clau
 import { PendingToolRegistry } from "../src/claude/pending-tools.js";
 import { createLogger } from "../src/logger.js";
 import type { Config } from "../src/config.js";
-import type { ResumeDecision } from "../src/session/store.js";
+import { SessionStore, type ResumeDecision } from "../src/session/store.js";
 
 const config: Config = {
   listenAddr: ":0",
@@ -849,7 +849,7 @@ test("a request with another configuration leaves the conversation's process ali
   runner.closeAll();
 });
 
-test("releases a claimed session when its turn fails, and forgets a missing one", async () => {
+test("keeps a session claimed when its turn fails, and forgets a missing one", async () => {
   const released: ResumeDecision[] = [];
   const decision: ResumeDecision = { kind: "resume", sessionId: "session-1", fromIndex: 0 };
   const failing = new ClaudeRunner(
@@ -859,6 +859,7 @@ test("releases a claimed session when its turn fails, and forgets a missing one"
       { type: "result", subtype: "error_during_execution", is_error: true, errors: ["rate_limit"], stop_reason: null, usage: {} },
     ]) as never,
   );
+  // The prompt reached the process, so the transcript may be dirty.
   await assert.rejects(() =>
     failing.run({
       conversationKey: "conv",
@@ -870,7 +871,7 @@ test("releases a claimed session when its turn fails, and forgets a missing one"
       release: (value) => released.push(value),
     }),
   );
-  assert.deepEqual(released, [decision]);
+  assert.deepEqual(released, []);
 
   const forgotten: string[] = [];
   const forking = new ClaudeRunner(
@@ -890,4 +891,82 @@ test("releases a claimed session when its turn fails, and forgets a missing one"
     forget: (sessionId) => forgotten.push(sessionId),
   });
   assert.deepEqual(forgotten, ["gone"]);
+});
+
+test("releases a claimed session when the turn never reached a process", async () => {
+  const { runner, run } = toolRunner(["t1"]);
+  // The parked turn holds the only slot.
+  await run("r1", undefined);
+
+  const released: ResumeDecision[] = [];
+  const decision: ResumeDecision = { kind: "resume", sessionId: "session-9", fromIndex: 0 };
+  const abort = new AbortController();
+  setTimeout(() => abort.abort(), 10);
+  await assert.rejects(
+    () =>
+      run("r2", undefined, {
+        conversationKey: "other",
+        signal: abort.signal,
+        plan: () => decision,
+        release: (value) => released.push(value),
+      }),
+    ClientAbort,
+  );
+  assert.deepEqual(released, [decision]);
+  runner.closeAll();
+});
+
+test("a retry after a failed turn forks at the last checkpoint", async () => {
+  const sessions = new SessionStore(undefined, createLogger("error"));
+  const scope = { model: "claude-sonnet-5-5", cwd: "/tmp", systemHash: "s" };
+  const history = [
+    { role: "user" as const, content: "one" },
+    { role: "assistant" as const, content: "reply" },
+  ];
+  sessions.record({ ...scope, sessionId: "session-1", history, leafUuid: "leaf-1" });
+  const messages = [...history, { role: "user" as const, content: "two" }];
+
+  const decisions: ResumeDecision[] = [];
+  const forks: Array<[string, string | undefined]> = [];
+  let fail = true;
+  const queryFn = (params: { options: Record<string, unknown> }) =>
+    fail
+      ? fakeQuery([
+          { type: "result", subtype: "error_during_execution", is_error: true, errors: ["rate_limit"], stop_reason: null, usage: {} },
+        ])(params)
+      : fakeQuery(textEvents)(params);
+  const runner = new ClaudeRunner(
+    config,
+    createLogger("error"),
+    queryFn as never,
+    undefined,
+    ((sessionId: string, options?: { upToMessageId?: string }) => {
+      forks.push([sessionId, options?.upToMessageId]);
+      return Promise.resolve({ sessionId: "fork-1" });
+    }) as never,
+  );
+  const attempt = (requestId: string) =>
+    runner.run({
+      conversationKey: "conv",
+      request: { model: scope.model, messages },
+      signal: new AbortController().signal,
+      requestId,
+      stream: false,
+      plan: () => {
+        const decision = sessions.plan({ ...scope, messages });
+        sessions.claim(decision);
+        decisions.push(decision);
+        return decision;
+      },
+      release: (decision) => sessions.release(decision),
+    });
+
+  await assert.rejects(() => attempt("first"));
+  fail = false;
+  const retry = await attempt("retry");
+
+  assert.deepEqual(decisions.map((decision) => decision.kind), ["resume", "fork"]);
+  assert.deepEqual(forks, [["session-1", "leaf-1"]]);
+  assert.equal(retry.forked, true);
+  runner.closeAll();
 });

@@ -189,7 +189,12 @@ export class SessionStore {
     if (decision.kind === "resume") session.tip = "";
   }
 
-  /** Undo a claim whose turn never reached the session. */
+  /**
+   * Undo a claim whose turn never reached the session. A turn that did reach
+   * it and then failed keeps the claim: the transcript may hold a partial
+   * exchange the client never saw, so the next request forks at the last
+   * checkpoint instead of appending after it.
+   */
   release(decision: ResumeDecision): void {
     if (decision.kind !== "resume" || !decision.historyHash) return;
     const session = this.sessions.get(decision.sessionId);
