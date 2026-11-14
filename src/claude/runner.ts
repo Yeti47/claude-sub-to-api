@@ -143,17 +143,33 @@ export class ClaudeRunner {
   }
 
   async run(input: RunInput): Promise<RunResult> {
-    let release: (() => void) | undefined;
-    try {
-      release = await this.locks.acquire(input.conversationKey, input.signal);
-    } catch {
-      throw new ClientAbort();
+    while (true) {
+      const key = this.lockKey(input);
+      let release: (() => void) | undefined;
+      try {
+        release = await this.locks.acquire(key, input.signal);
+      } catch {
+        throw new ClientAbort();
+      }
+      try {
+        // The parked turn may have been answered or closed while waiting.
+        if (this.lockKey(input) !== key) continue;
+        return await this.runLocked(input);
+      } finally {
+        release();
+      }
     }
-    try {
-      return await this.runLocked(input);
-    } finally {
-      release();
-    }
+  }
+
+  /**
+   * Tool results are serialized with the process that waits for them, not
+   * with the key they arrive under: that key may be held by a request that
+   * is itself waiting for the slot the parked process occupies.
+   */
+  private lockKey(input: RunInput): string {
+    const toolResults = lastToolResults(input.request.messages);
+    const parked = this.findParked([...toolResults.results.keys()]);
+    return parked?.key ?? input.conversationKey;
   }
 
   closeAll(reason = "Server shutting down"): void {
@@ -222,6 +238,8 @@ export class ClaudeRunner {
       );
     }
 
+    // The process now serves this conversation.
+    process.key = input.conversationKey;
     process.begin();
     const lastId = ids.at(-1);
     for (const id of ids) {
