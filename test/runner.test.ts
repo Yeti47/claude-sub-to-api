@@ -544,92 +544,131 @@ test("uses summarized adaptive thinking when requested", async () => {
   assert.deepEqual(options?.thinking, { type: "adaptive", display: "summarized" });
 });
 
-test("parks a tool_use turn and resumes it with the client result", async () => {
-  let pending: PendingToolRegistry | undefined;
-  const toolEvents = [
-    { type: "stream_event", event: { type: "message_start", message: { id: "msg_10", usage: { input_tokens: 4 } } } },
-    {
-      type: "stream_event",
-      event: {
-        type: "content_block_start",
-        index: 0,
-        content_block: { type: "tool_use", id: "t1", name: "mcp__claude_sub_to_api__lookup" },
-      },
-    },
-    { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"q":"x"}' } } },
-    { type: "stream_event", event: { type: "content_block_stop", index: 0 } },
-    { type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 2 } } },
-    { type: "stream_event", event: { type: "message_stop" } },
-  ];
-  const continuation = [
-    { type: "stream_event", event: { type: "message_start", message: { id: "msg_11", usage: { input_tokens: 6 } } } },
-    { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } },
-    { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "done" } } },
-    { type: "stream_event", event: { type: "content_block_stop", index: 0 } },
-    { type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } } },
-    { type: "stream_event", event: { type: "message_stop" } },
-    { type: "result", subtype: "success", is_error: false, result: "done", stop_reason: "end_turn", usage: { input_tokens: 6, output_tokens: 1 } },
-  ];
+const lookupTool = {
+  name: "lookup",
+  input_schema: { type: "object", properties: { q: { type: "string" } } },
+};
 
-  const queryFn = (params: { options: Record<string, unknown> }) => {
+function toolResultMessage(ids: string[], text?: string) {
+  return {
+    role: "user" as const,
+    content: [
+      ...ids.map((id) => ({ type: "tool_result" as const, tool_use_id: id, content: "42" })),
+      ...(text ? [{ type: "text" as const, text }] : []),
+    ],
+  };
+}
+
+/**
+ * A process whose first message calls `lookup` once per id and then blocks,
+ * like the CLI does, until every handler has its result.
+ */
+function toolQuery(
+  ids: string[],
+  state: { calls: number; pending?: PendingToolRegistry; results: unknown[] },
+  thenIds: string[] = [],
+) {
+  return (params: { options: Record<string, unknown> }) => {
+    state.calls += 1;
     const hooks = params.options.hooks as
       | { PreToolUse?: Array<{ hooks: Array<(input: Record<string, unknown>) => Promise<unknown>> }> }
       | undefined;
-    void hooks?.PreToolUse?.[0]?.hooks[0]?.({
-      hook_event_name: "PreToolUse",
-      tool_name: "mcp__claude_sub_to_api__lookup",
-      tool_use_id: "t1",
-    });
+    async function* round(roundIds: string[], messageId: string) {
+      for (const id of roundIds) {
+        void hooks?.PreToolUse?.[0]?.hooks[0]?.({
+          hook_event_name: "PreToolUse",
+          tool_name: "mcp__claude_sub_to_api__lookup",
+          tool_use_id: id,
+        });
+      }
+      yield { type: "stream_event", event: { type: "message_start", message: { id: messageId, usage: { input_tokens: 4 } } } };
+      for (const [index, id] of roundIds.entries()) {
+        yield { type: "stream_event", event: { type: "content_block_start", index, content_block: { type: "tool_use", id, name: "mcp__claude_sub_to_api__lookup" } } };
+        yield { type: "stream_event", event: { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: '{"q":"x"}' } } };
+        yield { type: "stream_event", event: { type: "content_block_stop", index } };
+      }
+      yield { type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 2 } } };
+      // Simulate the CLI invoking the MCP handlers after message_stop.
+      const calls: Array<Promise<unknown>> = [];
+      setTimeout(() => {
+        for (const _ of roundIds) {
+          const call = state.pending!.register("lookup", { q: "x" });
+          call.catch(() => {});
+          calls.push(call);
+        }
+      }, 0);
+      yield { type: "stream_event", event: { type: "message_stop" } };
+      state.results.push(...(await Promise.all(calls)));
+    }
     return {
       async *[Symbol.asyncIterator]() {
-        let call: Promise<unknown> | undefined;
-        for (const event of toolEvents) {
-          if (
-            event.type === "stream_event" &&
-            (event.event as { type?: string }).type === "message_stop"
-          ) {
-            // Simulate the CLI invoking the MCP handler after message_stop.
-            setTimeout(() => {
-              call = pending!.register("lookup", { q: "x" });
-            }, 0);
-          }
-          yield event;
-        }
-        await call;
-        for (const event of continuation) yield event;
+        yield* round(ids, "msg_10");
+        if (thenIds.length > 0) yield* round(thenIds, "msg_12");
+        yield { type: "stream_event", event: { type: "message_start", message: { id: "msg_11", usage: { input_tokens: 6 } } } };
+        yield { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } };
+        yield { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "done" } } };
+        yield { type: "stream_event", event: { type: "content_block_stop", index: 0 } };
+        yield { type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } } };
+        yield { type: "stream_event", event: { type: "message_stop" } };
+        yield { type: "result", subtype: "success", is_error: false, result: "done", stop_reason: "end_turn", usage: { input_tokens: 6, output_tokens: 1 } };
       },
       close() {},
     };
   };
+}
 
+function toolRunner(ids: string[], overrides: Partial<Config> = {}, thenIds: string[] = []) {
+  const state: { calls: number; pending?: PendingToolRegistry; results: unknown[] } = {
+    calls: 0,
+    results: [],
+  };
   const runner = new ClaudeRunner(
-    config,
+    { ...config, ...overrides },
     createLogger("error"),
-    queryFn as never,
-    () => (pending = new PendingToolRegistry()),
+    toolQuery(ids, state, thenIds) as never,
+    () => (state.pending = new PendingToolRegistry()),
   );
+  const first = { role: "user" as const, content: "find x" };
+  const call = {
+    role: "assistant" as const,
+    content: ids.map((id) => ({ type: "tool_use" as const, id, name: "lookup", input: { q: "x" } })),
+  };
+  const run = (
+    requestId: string,
+    answered: string[] | undefined,
+    extra: Partial<Parameters<ClaudeRunner["run"]>[0]> = {},
+  ) =>
+    runner.run({
+      request: {
+        model: "claude-sonnet-5-5",
+        messages: answered ? [first, call, toolResultMessage(answered)] : [first],
+        tools: [lookupTool],
+      },
+      conversationKey: "test",
+      signal: new AbortController().signal,
+      requestId,
+      stream: false,
+      ...extra,
+    });
+  return { runner, state, run };
+}
+
+test("parks a tool_use turn and continues it with the client's tool results", async () => {
+  const { runner, state, run } = toolRunner(["t1"]);
   const streamed: string[] = [];
-  let parkedRecord: RunResult | undefined;
-  const first = await runner.run({
-    request: {
-      model: "claude-sonnet-5-5",
-      messages: [{ role: "user", content: "find x" }],
-      tools: [{ name: "lookup", input_schema: { type: "object", properties: { q: { type: "string" } } } }],
-    },
-    conversationKey: "test",
-    signal: new AbortController().signal,
-    requestId: "r2",
+  const records: Array<[RunResult, ResumeDecision | undefined]> = [];
+  const record = (result: RunResult, decision?: ResumeDecision) => {
+    records.push([result, decision]);
+  };
+  const first = await run("r2", undefined, {
     stream: true,
     onEvent: (event) => streamed.push(String(event.type)),
-    record: (value) => {
-      parkedRecord = value;
-    },
+    record,
   });
 
-  assert.ok(first.parked);
-  assert.ok(parkedRecord?.parked);
-  assert.equal(parkedRecord?.leafUuid, undefined);
-  assert.equal(pending!.calls()[0]?.toolUseId, "t1");
+  assert.equal(first.parked, true);
+  assert.equal(records[0]?.[0].parked, true);
+  assert.equal(records[0]?.[0].leafUuid, undefined);
   assert.equal(first.response.stop_reason, "tool_use");
   assert.deepEqual(first.response.content[0], {
     type: "tool_use",
@@ -637,24 +676,122 @@ test("parks a tool_use turn and resumes it with the client result", async () => 
     name: "lookup",
     input: { q: "x" },
   });
-  assert.ok(streamed.includes("content_block_start"));
+  assert.deepEqual(streamed.slice(-2), ["message_delta", "message_stop"]);
 
-  const second = await first.parked!.resume({
-    request: {
-      model: "claude-sonnet-5-5",
-      messages: [{ role: "user", content: "find x" }],
+  let planned = 0;
+  const second = await run("r3", ["t1"], {
+    record,
+    plan: () => {
+      planned += 1;
+      return { kind: "fresh" };
     },
-    conversationKey: "test",
-    signal: new AbortController().signal,
-    requestId: "r3",
-    stream: false,
-    toolResults: new Map([
-      ["t1", { type: "tool_result", tool_use_id: "t1", content: "42" }],
-    ]),
-    steeringText: "",
   });
+  assert.equal(state.calls, 1);
+  assert.equal(planned, 0);
   assert.equal(second.parked, undefined);
+  assert.equal(second.reused, true);
   assert.deepEqual(second.response.content[0], { type: "text", text: "done" });
+  assert.deepEqual(state.results, [{ content: [{ type: "text", text: "42" }], isError: false }]);
+  // A continuation is recorded without a plan.
+  assert.equal(records[1]?.[1], undefined);
+  runner.closeAll();
+});
+
+test("tool results sent the moment the message ends find the parked turn", async () => {
+  const { runner, state, run } = toolRunner(["t1"], { maxConcurrency: 2 });
+  let followUp: Promise<RunResult> | undefined;
+  await run("r1", undefined, {
+    stream: true,
+    onEvent: (event) => {
+      // Another conversation key, so only the parked state can route it.
+      if (event.type === "message_stop") {
+        followUp = run("r2", ["t1"], { conversationKey: "other" });
+      }
+    },
+  });
+
+  const second = await followUp!;
+  assert.equal(state.calls, 1);
+  assert.equal(second.reused, true);
+  assert.deepEqual(second.response.content[0], { type: "text", text: "done" });
+  runner.closeAll();
+});
+
+test("tool results reach a parked turn while their own key waits for its slot", async () => {
+  const { runner, state, run } = toolRunner(["t1"], { maxConcurrency: 1 });
+  await run("r1", undefined);
+
+  // An unrelated request holds its key's lock while it waits for the slot.
+  const queued = run("r2", undefined, { conversationKey: "other" });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(state.calls, 1);
+
+  const second = await run("r3", ["t1"], { conversationKey: "other" });
+  assert.equal(second.reused, true);
+  assert.deepEqual(second.response.content[0], { type: "text", text: "done" });
+  // The finished turn yields its slot to the waiting request.
+  assert.equal((await queued).parked, true);
+  assert.equal(state.calls, 2);
+  runner.closeAll();
+});
+
+test("a turn continued under another key belongs to that key when it parks again", async () => {
+  const { runner, state, run } = toolRunner(["t1"], { maxConcurrency: 1 }, ["t2"]);
+  await run("r1", undefined);
+  const second = await run("r2", ["t1"], { conversationKey: "other" });
+  assert.equal(second.parked, true);
+  const rejected = state.pending!.calls()[0]!.result.then(
+    () => false,
+    () => true,
+  );
+
+  // A new message under the continuing key supersedes the parked turn.
+  await run("r3", undefined, { conversationKey: "other" });
+  assert.equal(await rejected, true);
+  assert.equal(state.calls, 2);
+  runner.closeAll();
+});
+
+test("an incomplete set of tool results leaves the turn parked", async () => {
+  const { runner, state, run } = toolRunner(["t1", "t2"]);
+  await run("r1", undefined);
+
+  await assert.rejects(
+    () => run("r2", ["t1"]),
+    (error: unknown) =>
+      error instanceof ApiError && error.status === 400 && /missing tool_result for t2/.test(error.message),
+  );
+  const second = await run("r3", ["t1", "t2"]);
+  assert.equal(state.calls, 1);
+  assert.equal(state.results.length, 2);
+  assert.deepEqual(second.response.content[0], { type: "text", text: "done" });
+  runner.closeAll();
+});
+
+test("a parked turn is closed when its results do not arrive in time", async () => {
+  const { runner, state, run } = toolRunner(["t1"], { parkedTurnTtlMs: 20 });
+  await run("r1", undefined);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  // The process is gone and its slot is free: the results start a new turn.
+  const second = await run("r2", ["t1"]);
+  assert.equal(state.calls, 2);
+  assert.equal(second.reused, undefined);
+  runner.closeAll();
+});
+
+test("a new message closes the conversation's unanswered parked turn", async () => {
+  const { runner, state, run } = toolRunner(["t1"]);
+  await run("r1", undefined);
+  const first = state.pending!;
+  const rejected = first.calls()[0]!.result.then(
+    () => false,
+    () => true,
+  );
+  await run("r2", undefined);
+  assert.equal(await rejected, true);
+  assert.equal(state.calls, 2);
+  runner.closeAll();
 });
 
 test("maps upstream HTTP statuses to Anthropic error statuses", async () => {

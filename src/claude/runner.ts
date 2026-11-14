@@ -1,4 +1,11 @@
-/** Runs one Messages API turn through the Claude Agent SDK. */
+/**
+ * Runs Messages API turns through the Claude Agent SDK.
+ *
+ * The runner owns every live Claude process and routes each request to one:
+ * tool results continue the parked turn that asked for them, an appended
+ * message goes to the idle process of its session, and anything else starts
+ * a process (resuming, forking or replaying as the session plan says).
+ */
 import { randomUUID } from "node:crypto";
 import {
   forkSession as sdkForkSession,
@@ -14,8 +21,13 @@ import type {
   ToolResultBlock,
   ToolUseBlock,
 } from "../anthropic/types.js";
-import { contentBlocks, prepareTurn } from "../anthropic/translate.js";
-import { buildToolBridge, type ToolBridge } from "../anthropic/tools.js";
+import {
+  contentBlocks,
+  lastToolResults,
+  prepareTurn,
+  type PreparedTurn,
+} from "../anthropic/translate.js";
+import { buildToolBridge } from "../anthropic/tools.js";
 import { MessageAssembler } from "./assembler.js";
 import { Semaphore } from "./semaphore.js";
 import {
@@ -24,44 +36,21 @@ import {
   type McpContent,
   type PendingToolCall,
 } from "./pending-tools.js";
-import { ParkedTurn, type ResumeParkedInput } from "./parked.js";
 import { TurnInput } from "./turn-input.js";
 import { KeyedLock } from "./keyed-lock.js";
+import { LiveProcess, type QueryHandle } from "./process.js";
+import {
+  ApiError,
+  ClientAbort,
+  ResumeFailed,
+  errorFor,
+  isMissingSession,
+  isMissingTranscript,
+} from "./errors.js";
+import { launchKey, queryOptions, stableStringify, wantsThinking } from "./options.js";
 import type { ResumeDecision } from "../session/store.js";
 
-export class ApiError extends Error {
-  constructor(readonly status: number, readonly type: string, message: string) {
-    super(message);
-    this.name = "ApiError";
-  }
-}
-
-export class ClientAbort extends Error {
-  constructor() {
-    super("client disconnected");
-    this.name = "ClientAbort";
-  }
-}
-
-class ResumeFailed extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ResumeFailed";
-  }
-}
-
-function isMissingSession(error: unknown): boolean {
-  const message = errorMessage(error);
-  return /no conversation found|session.*(not found|does not exist)|could not find.*session/i.test(
-    message,
-  );
-}
-
-/** Whether a failed fork means the source transcript or checkpoint is gone. */
-function isMissingTranscript(error: unknown): boolean {
-  if ((error as { code?: unknown } | null)?.code === "ENOENT") return true;
-  return /not found|no messages to fork|ENOENT/i.test(errorMessage(error));
-}
+export { ApiError, ClientAbort } from "./errors.js";
 
 export interface RunInput {
   /**
@@ -90,9 +79,8 @@ export interface RunInput {
   /** Drop a session whose transcript turned out to be missing. */
   forget?: (sessionId: string) => void;
   /**
-   * Persist the session binding before the conversation lock is released.
-   * `decision` is the plan that started the turn, or undefined for a parked
-   * tool continuation.
+   * Persist the turn before the conversation lock is released. `decision` is
+   * the plan that started the turn, or undefined for a tool continuation.
    */
   record?: (result: RunResult, decision?: ResumeDecision) => void;
 }
@@ -100,8 +88,8 @@ export interface RunInput {
 export interface RunResult {
   response: MessagesResponse;
   sessionId?: string;
-  /** Set when the turn stopped on a tool call and waits for client results. */
-  parked?: ParkedTurn;
+  /** The turn stopped on a tool call and its process waits for the results. */
+  parked?: boolean;
   /** Transcript UUID of the final main-chain assistant message. */
   leafUuid?: string;
   /** Whether this turn reused an already-running Claude process. */
@@ -118,118 +106,22 @@ export type ForkSession = (
   options?: { upToMessageId?: string; dir?: string },
 ) => Promise<{ sessionId: string }>;
 
-interface TurnState {
-  key: string;
-  model: string;
-  bridge?: ToolBridge;
-  pending: PendingToolRegistry;
-  input: TurnInput;
-  handle: QueryHandle;
-  iterator: AsyncIterator<SDKMessage>;
-  controller: AbortController;
-  includeThinking: boolean;
-  release: () => void;
-  sessionId?: string;
-  launchKey: string;
-  busy: boolean;
-  lastUsed: number;
-  idleTimer?: ReturnType<typeof setTimeout>;
-  closed: boolean;
-}
-
-interface QueryHandle extends AsyncIterable<SDKMessage> {
-  close?: () => void;
-}
-
 export type QueryFactory = (params: {
   prompt: AsyncIterable<SDKUserMessage>;
   options: Record<string, unknown>;
 }) => QueryHandle;
 
-function thinkingOption(request: MessagesRequest, maxTokens: number): Record<string, unknown> {
-  const thinking = request.thinking;
-  if (!thinking || thinking.type === "disabled") return { type: "disabled" };
-  if (thinking.type === "adaptive") return { type: "adaptive", display: "summarized" };
-  const budget = Number(thinking.budget_tokens ?? 0);
-  const limit = maxTokens - 1;
-  if (budget <= 0 || limit < 1024) return { type: "adaptive", display: "summarized" };
-  return {
-    type: "enabled",
-    budgetTokens: Math.min(Math.max(1024, budget), limit),
-    display: "summarized",
-  };
-}
-
-function errorFor(result: {
-  type: string;
-  message: string;
-  status?: number;
-  resetAt?: number;
-}): ApiError {
-  const type = result.type.toLowerCase();
-  const haystack = `${type} ${result.message}`.toLowerCase();
-  const reset = result.resetAt
-    ? ` Resets at ${new Date(result.resetAt).toISOString()}.`
-    : "";
-  const message = `${result.message}${reset}`;
-
-  if (result.status !== undefined) {
-    if (result.status === 401) return new ApiError(401, "authentication_error", message);
-    if (result.status === 403) return new ApiError(403, "permission_error", message);
-    if (result.status === 404) return new ApiError(404, "not_found_error", message);
-    if (result.status === 429) return new ApiError(429, "rate_limit_error", message);
-    if (result.status === 529) return new ApiError(529, "overloaded_error", message);
-    if (result.status >= 500) return new ApiError(502, "api_error", message);
-    if (result.status >= 400) return new ApiError(400, "invalid_request_error", message);
-  }
-
-  if (haystack.includes("rate_limit")) return new ApiError(429, "rate_limit_error", message);
-  if (haystack.includes("overloaded")) return new ApiError(529, "overloaded_error", message);
-  if (
-    haystack.includes("authentication") ||
-    haystack.includes("authenticate") ||
-    haystack.includes("oauth") ||
-    haystack.includes("credential") ||
-    haystack.includes("login")
-  )
-    return new ApiError(401, "authentication_error", message);
-  if (haystack.includes("permission")) return new ApiError(403, "permission_error", message);
-  if (type.includes("model_not_found")) return new ApiError(404, "not_found_error", message);
-  if (type.includes("invalid_request")) return new ApiError(400, "invalid_request_error", message);
-  if (type.includes("refusal")) return new ApiError(400, "invalid_request_error", message);
-  return new ApiError(502, "api_error", message);
-}
-
-const RUNTIME_NOTE = [
-  "<runtime_info>",
-  "You are running in claude-sub-to-api, an Anthropic-compatible HTTP API backed by a Claude subscription, through the Claude Code harness.",
-  "The built-in Claude Code tools (Bash, Read, Edit, and so on) are disabled. The only tools available are the ones defined in this request; they are provided by the API client, which executes them, and their results come back in a later message.",
-  "If you are asked what you are running in, say this plainly. Do not claim to be Claude Code itself, and do not imply the API client is Claude Code.",
-  "</runtime_info>",
-].join("\n");
-
-function systemPromptOption(clientSystem: string | undefined): Record<string, unknown> {
-  const append = [
-    RUNTIME_NOTE,
-    clientSystem
-      ? `# API client instructions\n\nThe API client that sent this request supplied the following instructions. Follow them for this turn; they take precedence over the harness's coding-specific guidance.\n\n${clientSystem}`
-      : "",
-  ]
-    .filter(Boolean)
-    .join("\n\n");
-
-  return {
-    type: "preset",
-    preset: "claude_code",
-    // Keeps cwd, memory path and git status out of the system prompt, so it
-    // stays stable across sessions and can be read from the prompt cache.
-    excludeDynamicSections: true,
-    append,
-  };
+/** How a new process is launched. */
+interface Launch {
+  prepared: PreparedTurn;
+  launchKey: string;
+  resumeSessionId?: string;
 }
 
 export class ClaudeRunner {
   private readonly limit: Semaphore;
+  private readonly processes = new Set<LiveProcess>();
+  private readonly locks = new KeyedLock();
 
   constructor(
     private readonly config: Config,
@@ -241,64 +133,54 @@ export class ClaudeRunner {
     this.limit = new Semaphore(config.maxConcurrency);
   }
 
-  private childEnv(maxTokens: number): Record<string, string> {
-    const env: Record<string, string> = {};
-    for (const [key, value] of Object.entries(process.env)) {
-      if (value !== undefined) env[key] = value;
+  async run(input: RunInput): Promise<RunResult> {
+    while (true) {
+      const key = this.lockKey(input);
+      let release: (() => void) | undefined;
+      try {
+        release = await this.locks.acquire(key, input.signal);
+      } catch {
+        throw new ClientAbort();
+      }
+      try {
+        // The parked turn may have been answered or closed while waiting.
+        if (this.lockKey(input) !== key) continue;
+        return await this.runLocked(input);
+      } finally {
+        release();
+      }
     }
-    if (this.config.claudeConfigDirExplicit) {
-      env.CLAUDE_CONFIG_DIR = this.config.claudeConfigDir;
-    } else {
-      delete env.CLAUDE_CONFIG_DIR;
-    }
-    env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(maxTokens);
-    env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
-    env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
-    env.CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH = "8192";
-    // Claude Code features that duplicate this proxy's own behavior, or that
-    // would change the response shape without the API client knowing.
-    env.DISABLE_AUTO_COMPACT = "1";
-    env.CLAUDE_CODE_ENABLE_AWAY_SUMMARY = "0";
-    env.ENABLE_TOOL_SEARCH = "false";
-    env.CLAUDE_CODE_DISABLE_ADVISOR_TOOL = "1";
-    env.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK = "1";
-    env.CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK = "1";
-    env.MAX_MCP_OUTPUT_TOKENS = "200000";
-    // A resumed session may see a different system prompt or tools; drop
-    // thinking blocks bound to the old prompt instead of failing the request.
-    env.CLAUDE_CODE_POLISHED_DEWDROP = "drop";
-    delete env.CLAUDE_CODE_SIMPLE;
-    delete env.CLAUDE_CODE_EFFORT_LEVEL;
-    delete env.MCP_TOOL_TIMEOUT;
-    // The API client owns retries. Hidden CLI retries would produce several
-    // model messages for one API request, which cannot be represented as one
-    // Anthropic response (especially in a stream).
-    if (!env.CLAUDE_CODE_MAX_RETRIES) env.CLAUDE_CODE_MAX_RETRIES = "0";
-    // The CLI is driven by an API client, not a terminal user.
-    delete env.ANTHROPIC_API_KEY;
-    delete env.ANTHROPIC_AUTH_TOKEN;
-    return env;
   }
 
-  private readonly processes = new Set<TurnState>();
-  private readonly locks = new KeyedLock();
+  /**
+   * Tool results are serialized with the process that waits for them, not
+   * with the key they arrive under: that key may be held by a request that
+   * is itself waiting for the slot the parked process occupies.
+   */
+  private lockKey(input: RunInput): string {
+    const toolResults = lastToolResults(input.request.messages);
+    const parked = this.findParked([...toolResults.results.keys()]);
+    return parked?.key ?? input.conversationKey;
+  }
 
-  async run(input: RunInput): Promise<RunResult> {
-    let release: (() => void) | undefined;
-    try {
-      release = await this.locks.acquire(input.conversationKey, input.signal);
-    } catch {
-      throw new ClientAbort();
-    }
-    try {
-      return await this.runLocked(input);
-    } finally {
-      release();
-    }
+  closeAll(reason = "Server shutting down"): void {
+    for (const process of [...this.processes]) process.close(reason);
   }
 
   private async runLocked(input: RunInput): Promise<RunResult> {
     if (input.signal.aborted) throw new ClientAbort();
+
+    const toolResults = lastToolResults(input.request.messages);
+    const parked = this.findParked([...toolResults.results.keys()]);
+    if (parked) return this.continueParked(parked, input, toolResults);
+
+    // The conversation moved on without answering its tool calls.
+    for (const process of [...this.processes]) {
+      if (process.key === input.conversationKey && process.status === "parked") {
+        process.close("Superseded by a new request");
+      }
+    }
+
     // Planning happens under the conversation lock, so a concurrent request
     // cannot reuse a plan computed against an older committed history.
     const decision: ResumeDecision = input.plan
@@ -319,6 +201,50 @@ export class ClaudeRunner {
     }
   }
 
+  /** The parked process waiting for any of these tool results. */
+  private findParked(toolUseIds: string[]): LiveProcess | undefined {
+    if (toolUseIds.length === 0) return undefined;
+    for (const process of this.processes) {
+      if (process.status !== "parked") continue;
+      const pending = process.pending.pendingIds();
+      if (toolUseIds.some((id) => pending.includes(id))) return process;
+    }
+    return undefined;
+  }
+
+  private async continueParked(
+    process: LiveProcess,
+    input: RunInput,
+    toolResults: ReturnType<typeof lastToolResults>,
+  ): Promise<RunResult> {
+    const ids = process.pending.pendingIds();
+    // An incomplete answer leaves the turn parked for a corrected request.
+    const missing = ids.filter((id) => !toolResults.results.has(id));
+    if (missing.length > 0) {
+      throw new ApiError(
+        400,
+        "invalid_request_error",
+        `missing tool_result for ${missing.join(", ")}`,
+      );
+    }
+
+    // The process now serves this conversation.
+    process.key = input.conversationKey;
+    process.begin();
+    const lastId = ids.at(-1);
+    for (const id of ids) {
+      const block = toolResults.results.get(id)!;
+      process.pending.resolve(
+        id,
+        toMcpResult(block, id === lastId ? toolResults.steeringText : ""),
+      );
+    }
+    process.pending.beginPhase();
+    const result = { ...(await this.consume(process, input, false)), reused: true };
+    input.record?.(result);
+    return result;
+  }
+
   private async runDecided(input: RunInput, planned: ResumeDecision): Promise<RunResult> {
     let decision = planned;
     // This conversation moved to a fork, so its idle process on the source
@@ -329,9 +255,9 @@ export class ClaudeRunner {
         if (
           live.key === input.conversationKey &&
           live.sessionId === decision.sessionId &&
-          !live.busy
+          live.status === "idle"
         ) {
-          this.closeState(live, "Forking the conversation history");
+          live.close("Forking the conversation history");
         }
       }
     }
@@ -355,64 +281,55 @@ export class ClaudeRunner {
       }
     }
 
-    let prepared = prepareTurn(input.request, { resumeFromIndex });
-    let launchKey = this.launchKey(input.request, prepared);
+    const prepared = prepareTurn(input.request, { resumeFromIndex });
+    const launch: Launch = {
+      prepared,
+      launchKey: launchKey(this.config, input.request, prepared),
+      resumeSessionId,
+    };
 
     // The live process that owns the resumed session, if there is one. A
     // claimed session has no running turn, so a process that cannot take this
     // turn (different model, system prompt or tools) is closed, not shared.
-    let state = resumeSessionId
-      ? [...this.processes].find((live) => live.sessionId === resumeSessionId)
+    let live = resumeSessionId
+      ? [...this.processes].find((process) => process.sessionId === resumeSessionId)
       : undefined;
-    if (state && (state.closed || state.busy || state.launchKey !== launchKey)) {
-      this.closeState(state, "Session configuration changed");
-      state = undefined;
+    if (live && (live.status !== "idle" || live.launchKey !== launch.launchKey)) {
+      live.close("Session configuration changed");
+      live = undefined;
     }
 
     try {
-      if (state) {
-        this.cancelIdle(state);
+      if (live) {
         if (input.signal.aborted) throw new ClientAbort();
-        // The process now serves this conversation: a tool turn it parks is
-        // continued under this conversation's lock, not its previous one's.
-        state.key = input.conversationKey;
-        state.busy = true;
-        state.lastUsed = Date.now();
-        state.pending.beginPhase();
-        state.input.push({ ...prepared.prompt, uuid: randomUUID() } as SDKUserMessage);
-        const result = await this.consume(state, { ...input, resumeSessionId: undefined });
-        const finished = { ...result, reused: true, forked };
-        input.record?.(finished, decision);
-        return finished;
+        // The process now serves this conversation.
+        live.key = input.conversationKey;
+        live.begin();
+        live.pending.beginPhase();
+        live.input.push({ ...prepared.prompt, uuid: randomUUID() } as SDKUserMessage);
+        const result = { ...(await this.consume(live, input, false)), reused: true, forked };
+        input.record?.(result, decision);
+        return result;
       }
-      const result = await this.startProcess(
-        { ...input, resumeSessionId, resumeFromIndex },
-        prepared,
-        launchKey,
-      );
+      const result = await this.startProcess(input, launch);
       if (resumeSessionId !== undefined) result.resumed = true;
       if (forked) result.forked = true;
       input.record?.(result, decision);
       return result;
     } catch (error) {
-      if (error instanceof ResumeFailed) {
-        this.logger.warn("Claude session could not be resumed; replaying history", {
-          requestId: input.requestId,
-          sessionId: resumeSessionId,
-        });
-        if (resumeSessionId) input.forget?.(resumeSessionId);
-        const fresh = {
-          ...input,
-          resumeSessionId: undefined,
-          resumeFromIndex: undefined,
-        };
-        prepared = prepareTurn(input.request);
-        launchKey = this.launchKey(input.request, prepared);
-        const result = await this.startProcess(fresh, prepared, launchKey);
-        input.record?.(result, { kind: "fresh" });
-        return result;
-      }
-      throw error;
+      if (!(error instanceof ResumeFailed)) throw error;
+      this.logger.warn("Claude session could not be resumed; replaying history", {
+        requestId: input.requestId,
+        sessionId: resumeSessionId,
+      });
+      if (resumeSessionId) input.forget?.(resumeSessionId);
+      const replay = prepareTurn(input.request);
+      const result = await this.startProcess(input, {
+        prepared: replay,
+        launchKey: launchKey(this.config, input.request, replay),
+      });
+      input.record?.(result, { kind: "fresh" });
+      return result;
     }
   }
 
@@ -445,157 +362,64 @@ export class ClaudeRunner {
     }
   }
 
-  private async startProcess(
-    input: RunInput,
-    prepared: ReturnType<typeof prepareTurn>,
-    launchKey: string,
-  ): Promise<RunResult> {
+  private async startProcess(input: RunInput, launch: Launch): Promise<RunResult> {
     const release = await this.acquireSlot(input.signal);
     if (input.signal.aborted) {
       release();
       throw new ClientAbort();
     }
-    let state: TurnState | undefined;
+    let process: LiveProcess | undefined;
     try {
+      const { request, requestId } = input;
       const pending = this.createPending();
-      const bridge = buildToolBridge(prepared.tools, pending);
+      const bridge = buildToolBridge(launch.prepared.tools, pending);
       const controller = new AbortController();
       const inputQueue = new TurnInput();
-      const options = this.queryOptions(input, prepared, bridge, controller);
-      const handle = this.queryFn({ prompt: inputQueue, options });
-      state = {
+      const handle = this.queryFn({
+        prompt: inputQueue,
+        options: queryOptions({
+          config: this.config,
+          request,
+          prepared: launch.prepared,
+          bridge,
+          controller,
+          persistSession: input.persistSession !== false,
+          resumeSessionId: launch.resumeSessionId,
+          onStderr: (line) => this.logger.debug("claude stderr", { requestId, line }),
+        }),
+      });
+      process = new LiveProcess({
         key: input.conversationKey,
-        model: input.request.model,
+        model: request.model,
+        launchKey: launch.launchKey,
+        includeThinking: wantsThinking(request),
         bridge,
         pending,
         input: inputQueue,
         handle,
-        iterator: handle[Symbol.asyncIterator](),
         controller,
-        includeThinking:
-          input.request.thinking?.type === "enabled" ||
-          input.request.thinking?.type === "adaptive",
-        release,
-        sessionId:
-          input.resumeSessionId && input.resumeFromIndex !== undefined
-            ? input.resumeSessionId
-            : undefined,
-        launchKey,
-        busy: true,
-        lastUsed: Date.now(),
-        closed: false,
-      };
-      this.processes.add(state);
-      inputQueue.push({ ...prepared.prompt, uuid: randomUUID() } as SDKUserMessage);
-      return await this.consume(state, input);
+        sessionId: launch.resumeSessionId,
+        onClose: (closed) => {
+          this.processes.delete(closed);
+          release();
+        },
+      });
+      this.processes.add(process);
+      inputQueue.push({ ...launch.prepared.prompt, uuid: randomUUID() } as SDKUserMessage);
     } catch (error) {
-      if (state) this.closeState(state, "Failed to start turn");
+      if (process) process.close("Failed to start turn");
       else release();
       throw error;
     }
-  }
-
-  private queryOptions(
-    input: RunInput,
-    prepared: ReturnType<typeof prepareTurn>,
-    bridge: ToolBridge | undefined,
-    controller: AbortController,
-  ): Record<string, unknown> {
-    const { request, requestId } = input;
-    const maxTokens = Math.min(
-      Math.max(1, request.max_tokens ?? this.config.defaultMaxTokens),
-      64_000,
-    );
-    // Some models reason even when thinking is off; that reasoning spends
-    // the CLI's output budget. Give short requests headroom so the answer is
-    // not cut off before it starts.
-    const cliMaxTokens =
-      request.thinking?.type === "enabled" || request.thinking?.type === "adaptive"
-        ? maxTokens
-        : Math.max(maxTokens, 1024);
-
-    const options: Record<string, unknown> = {
-      cwd: this.config.cwd,
-      env: this.childEnv(cliMaxTokens),
-      model: request.model,
-      includePartialMessages: true,
-      persistSession: input.persistSession !== false,
-      settingSources: [],
-      strictMcpConfig: true,
-      skills: [],
-      tools: [],
-      permissionMode: "dontAsk",
-      thinking: thinkingOption(request, maxTokens),
-      // Deliver prompts exactly as sent: do not expand @paths, run /commands,
-      // or inject Claude Code's own per-turn context.
-      verbatimPrompts: true,
-      settings: { disableAllHooks: true },
-      abortController: controller,
-      stderr: (line: string) => this.logger.debug("claude stderr", { requestId, line }),
-    };
-    const systemOption = systemPromptOption(prepared.system);
-    if (systemOption) options.systemPrompt = systemOption;
-    const effort = request.output_config?.effort;
-    if (
-      typeof effort === "string" &&
-      ["low", "medium", "high", "xhigh", "max"].includes(effort)
-    ) {
-      options.effort = effort;
-    }
-    if (bridge) {
-      options.mcpServers = bridge.mcpServers;
-      options.allowedTools = bridge.exposedNames;
-      options.hooks = {
-        PreToolUse: [
-          {
-            hooks: [
-              async (input: Record<string, unknown>) => {
-                if (
-                  input.hook_event_name === "PreToolUse" &&
-                  typeof input.tool_name === "string" &&
-                  typeof input.tool_use_id === "string"
-                ) {
-                  bridge.beforeToolUse(input.tool_name, input.tool_use_id);
-                }
-                return {};
-              },
-            ],
-          },
-        ],
-      };
-    }
-    if (input.resumeSessionId && input.resumeFromIndex !== undefined) {
-      options.resume = input.resumeSessionId;
-    }
-    return options;
-  }
-
-  private launchKey(
-    request: MessagesRequest,
-    prepared: ReturnType<typeof prepareTurn>,
-  ): string {
-    const maxTokens = Math.min(
-      Math.max(1, request.max_tokens ?? this.config.defaultMaxTokens),
-      64_000,
-    );
-    return stableStringify({
-      model: request.model,
-      system: prepared.system ?? null,
-      tools: prepared.tools,
-      maxTokens,
-      thinking: thinkingOption(request, maxTokens),
-      effort: request.output_config?.effort ?? null,
-      cwd: this.config.cwd,
-      configDir: this.config.claudeConfigDir,
-    });
+    return this.consume(process, input, launch.resumeSessionId !== undefined);
   }
 
   private async acquireSlot(signal: AbortSignal): Promise<() => void> {
     if (this.processes.size >= this.config.maxConcurrency) {
       const idle = [...this.processes]
-        .filter((state) => !state.busy && !state.closed)
+        .filter((process) => process.status === "idle")
         .sort((a, b) => a.lastUsed - b.lastUsed)[0];
-      if (idle) this.closeState(idle, "Evicted idle session");
+      if (idle) idle.close("Evicted idle session");
     }
     try {
       return await this.limit.acquire(signal);
@@ -604,44 +428,28 @@ export class ClaudeRunner {
     }
   }
 
-  private cancelIdle(state: TurnState): void {
-    if (!state.idleTimer) return;
-    clearTimeout(state.idleTimer);
-    state.idleTimer = undefined;
-  }
-
-  private armIdle(state: TurnState): void {
-    this.cancelIdle(state);
-    if (state.closed || state.busy) return;
-    if (this.config.sessionIdleMs <= 0) {
-      this.closeState(state, "Idle session closed");
-      return;
-    }
-    state.idleTimer = setTimeout(() => {
-      state.idleTimer = undefined;
-      if (!state.busy && !state.closed) this.closeState(state, "Idle session closed");
-    }, this.config.sessionIdleMs);
-    state.idleTimer.unref?.();
-  }
-
-  closeAll(reason = "Server shutting down"): void {
-    for (const state of [...this.processes]) this.closeState(state, reason);
-  }
-
-  private async consume(state: TurnState, input: RunInput): Promise<RunResult> {
+  /**
+   * Read the running turn of a process until it completes or stops on tool
+   * calls. Any failure closes the process.
+   */
+  private async consume(
+    process: LiveProcess,
+    input: RunInput,
+    resuming: boolean,
+  ): Promise<RunResult> {
     if (input.signal.aborted) {
-      this.closeState(state, "Client aborted");
+      process.close("Client aborted");
       throw new ClientAbort();
     }
     const assembler = new MessageAssembler(
-      state.model,
-      state.bridge,
+      process.model,
+      process.bridge,
       input.stream ? input.onEvent : undefined,
-      state.includeThinking,
+      process.includeThinking,
     );
     const onAbort = () => {
       this.logger.debug("client aborted turn", { requestId: input.requestId });
-      state.controller.abort();
+      process.controller.abort();
     };
     input.signal.addEventListener("abort", onAbort, { once: true });
     let lastMessage: Record<string, unknown> | undefined;
@@ -649,7 +457,7 @@ export class ClaudeRunner {
 
     try {
       while (true) {
-        const next = await state.iterator.next();
+        const next = await process.iterator.next();
         if (next.done) {
           ended = true;
           break;
@@ -666,34 +474,37 @@ export class ClaudeRunner {
               : undefined,
         });
         assembler.handle(message);
-        if (assembler.sessionId) state.sessionId = assembler.sessionId;
+        if (assembler.sessionId) process.sessionId = assembler.sessionId;
 
         if (assembler.sawToolUse && assembler.sawMessageStop) {
           const response = assembler.response();
           const blocks = response.content.filter(
             (block): block is ToolUseBlock => block.type === "tool_use",
           );
-          await state.pending.waitFor(blocks.length, 15_000, input.signal);
-          if (!matchToolCalls(blocks, state.pending.calls(), state.pending)) {
+          await process.pending.waitFor(blocks.length, 15_000, input.signal);
+          if (!matchToolCalls(blocks, process.pending.calls(), process.pending)) {
             throw new ApiError(502, "api_error", "Claude requested a tool the bridge could not match");
           }
-          state.busy = true;
+          // Park first, then let the client see the message end: its tool
+          // results can arrive immediately and must find the parked turn.
+          process.park(this.config.parkedTurnTtlMs);
+          assembler.flush();
           return {
             response,
-            sessionId: state.sessionId,
+            sessionId: process.sessionId,
             leafUuid: assembler.leafUuid,
-            parked: this.makeParked(state),
+            parked: true,
           };
         }
         if (lastMessage.type === "result") break;
       }
     } catch (error) {
-      this.closeState(state, "Turn failed");
+      process.close("Turn failed");
       if (input.signal.aborted) throw new ClientAbort();
       if (error instanceof ApiError || error instanceof ResumeFailed || error instanceof ClientAbort) {
         throw error;
       }
-      if (input.resumeSessionId && !assembler.sawStreamEvents) {
+      if (resuming && !assembler.sawStreamEvents) {
         const reason = assembler.resultError?.message ?? errorMessage(error);
         if (isMissingSession(reason)) throw new ResumeFailed(reason);
       }
@@ -707,123 +518,44 @@ export class ClaudeRunner {
       input.signal.removeEventListener("abort", onAbort);
     }
 
-    if (assembler.fatalError && assembler.resultError) {
-      this.closeState(state, "Turn failed");
-      throw this.resultFailure(assembler, input);
-    }
-    if (assembler.resultError && assembler.content.length === 0) {
-      this.closeState(state, "Turn failed");
-      throw this.resultFailure(assembler, input);
+    const failed =
+      assembler.resultError && (assembler.fatalError || assembler.content.length === 0);
+    if (failed) {
+      process.close("Turn failed");
+      // A missing session on a resume is retryable by replaying the
+      // transcript, so it is surfaced as ResumeFailed instead of a 502.
+      const error = assembler.resultError!;
+      if (resuming && !assembler.sawStreamEvents && isMissingSession(error.message)) {
+        throw new ResumeFailed(error.message);
+      }
+      throw errorFor(error);
     }
     if (assembler.content.length === 0 && typeof lastMessage?.result === "string") {
       assembler.content = [{ type: "text", text: lastMessage.result }];
     }
-    if (assembler.content.length === 0) {
-      if (assembler.stopReason !== "max_tokens" && assembler.stopReason !== "refusal") {
-        this.closeState(state, "Empty response");
-        throw new ApiError(502, "api_error", "Claude Code returned an empty response");
-      }
+    if (
+      assembler.content.length === 0 &&
+      assembler.stopReason !== "max_tokens" &&
+      assembler.stopReason !== "refusal"
+    ) {
+      process.close("Empty response");
+      throw new ApiError(502, "api_error", "Claude Code returned an empty response");
     }
     const response = assembler.response();
-    state.sessionId = assembler.sessionId ?? state.sessionId;
-    state.busy = false;
-    state.lastUsed = Date.now();
-    if (ended) this.closeState(state, "Claude process ended");
+    // A message that stopped on a tool call but never reached the park above
+    // (the process ended first) still owes the client its closing events.
+    assembler.flush();
+    process.sessionId = assembler.sessionId ?? process.sessionId;
+    if (ended) process.close("Claude process ended");
     else if (this.limit.waiting > 0) {
-      this.closeState(state, "Yielded capacity to a waiting conversation");
-    } else this.armIdle(state);
+      process.close("Yielded capacity to a waiting conversation");
+    } else process.rest(this.config.sessionIdleMs);
     return {
       response,
-      sessionId: state.sessionId,
+      sessionId: process.sessionId,
       leafUuid: assembler.leafUuid,
     };
   }
-
-  /**
-   * Convert a completed result error into the API error to throw. A missing
-   * session on a resume is retryable by replaying the transcript, so it is
-   * surfaced as ResumeFailed instead of a 502.
-   */
-  private resultFailure(assembler: MessageAssembler, input: RunInput): Error {
-    const error = assembler.resultError!;
-    if (
-      input.resumeSessionId &&
-      !assembler.sawStreamEvents &&
-      isMissingSession(error.message)
-    ) {
-      return new ResumeFailed(error.message);
-    }
-    return errorFor(error);
-  }
-
-  private makeParked(state: TurnState): ParkedTurn {
-    return new ParkedTurn(randomUUID(), state.sessionId, state.pending, {
-      resume: async (input) => {
-        let release: (() => void) | undefined;
-        try {
-          release = await this.locks.acquire(state.key, input.signal);
-        } catch {
-          throw new ClientAbort();
-        }
-        try {
-          return await this.resumeParked(state, input);
-        } finally {
-          release();
-        }
-      },
-      close: (reason) => this.closeState(state, reason),
-    });
-  }
-
-  private async resumeParked(state: TurnState, input: ResumeParkedInput): Promise<RunResult> {
-    if (input.signal.aborted) throw new ClientAbort();
-    const ids = state.pending.pendingIds();
-    for (const id of ids) {
-      if (!input.toolResults.has(id)) {
-        throw new ApiError(400, "invalid_request_error", `missing tool_result for ${id}`);
-      }
-    }
-    const lastId = ids.at(-1);
-    for (const id of ids) {
-      const block = input.toolResults.get(id)!;
-      state.pending.resolve(id, toMcpResult(block, id === lastId ? input.steeringText : ""));
-    }
-    state.pending.beginPhase();
-    try {
-      const result = await this.consume(state, { ...input, resumeSessionId: undefined });
-      const finished = { ...result, reused: true };
-      input.record?.(finished);
-      return finished;
-    } catch (error) {
-      this.closeState(state, "Tool continuation failed");
-      throw error;
-    }
-  }
-
-  private closeState(state: TurnState, reason: string): void {
-    if (state.closed) return;
-    state.closed = true;
-    this.cancelIdle(state);
-    state.pending.rejectAll(new Error(reason));
-    state.input.end();
-    try {
-      state.handle.close?.();
-    } catch {
-      // already closed
-    }
-    this.processes.delete(state);
-    state.release();
-  }
-}
-
-function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record)
-    .sort()
-    .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
-    .join(",")}}`;
 }
 
 function matchToolCalls(

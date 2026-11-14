@@ -35,6 +35,25 @@ export function contentBlocks(content: string | ContentBlock[]): ContentBlock[] 
   return Array.isArray(content) ? content : [];
 }
 
+/** The tool results in a request's final user message, and any text sent with them. */
+export function lastToolResults(messages: Message[]): {
+  results: Map<string, ToolResultBlock>;
+  steeringText: string;
+} {
+  const results = new Map<string, ToolResultBlock>();
+  let steeringText = "";
+  const lastUser = [...(messages ?? [])].reverse().find((message) => message.role === "user");
+  if (!lastUser) return { results, steeringText };
+  for (const block of contentBlocks(lastUser.content)) {
+    if (block.type === "tool_result") {
+      results.set(block.tool_use_id, block);
+    } else if (block.type === "text" && block.text.trim()) {
+      steeringText += `${steeringText ? "\n" : ""}${block.text}`;
+    }
+  }
+  return { results, steeringText };
+}
+
 export function systemText(system: unknown): string | undefined {
   if (!system) return undefined;
   if (typeof system === "string") return system.trim() || undefined;
