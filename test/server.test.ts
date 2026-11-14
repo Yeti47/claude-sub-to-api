@@ -20,6 +20,7 @@ const config: Config = {
   maxConcurrency: 1,
   requestTimeoutMs: 60_000,
   defaultMaxTokens: 100,
+  systemPromptMode: "claude-code",
   parkedTurnTtlMs: 0,
   sessionIdleMs: 0,
   parkedEvictableAfterMs: 0,

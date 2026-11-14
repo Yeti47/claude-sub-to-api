@@ -10,6 +10,15 @@ import { join } from "node:path";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
+/**
+ * How the upstream system prompt is assembled.
+ *
+ * `claude-code` sends the Claude Code preset plus a one-line runtime note, and
+ * keeps the client's system prompt out of it (the Claude Code hosts do this).
+ * `full` also appends the client's system prompt as instructions.
+ */
+export type SystemPromptMode = "claude-code" | "full";
+
 export interface Config {
   listenAddr: string;
   proxyApiKey: string;
@@ -26,6 +35,8 @@ export interface Config {
   requestTimeoutMs: number;
   /** Default output-token ceiling, matching the Anthropic API default. */
   defaultMaxTokens: number;
+  /** How the upstream system prompt includes the client's instructions. */
+  systemPromptMode: SystemPromptMode;
   /** Optional path for persisted conversation -> Claude session bindings. */
   statePath?: string;
   /** How long a turn may wait for client tool results before it is closed. */
@@ -74,6 +85,9 @@ export function loadConfig(envVars: NodeJS.ProcessEnv = process.env): Config {
   const rawLevel = (envVars.LOG_LEVEL?.trim().toLowerCase() || "info") as LogLevel;
   const logLevel = LEVELS.includes(rawLevel) ? rawLevel : "info";
   const explicitConfigDir = envVars.CLAUDE_CONFIG_DIR?.trim();
+  const rawPromptMode = envVars.SYSTEM_PROMPT_MODE?.trim().toLowerCase();
+  const systemPromptMode: SystemPromptMode =
+    rawPromptMode === "full" ? "full" : "claude-code";
 
   return {
     listenAddr: envVars.LISTEN_ADDR?.trim() || "127.0.0.1:8080",
@@ -85,6 +99,7 @@ export function loadConfig(envVars: NodeJS.ProcessEnv = process.env): Config {
     maxConcurrency: intEnv("MAX_CONCURRENCY", 4, 1, 64),
     requestTimeoutMs: intEnv("REQUEST_TIMEOUT_MS", 15 * 60_000, 10_000, 3_600_000),
     defaultMaxTokens: intEnv("DEFAULT_MAX_TOKENS", 8192, 1, 64_000),
+    systemPromptMode,
     statePath: envVars.STATE_PATH?.trim() || undefined,
     parkedTurnTtlMs: intEnv("PARKED_TURN_TTL_MS", 30 * 60_000, 0, 24 * 60 * 60_000),
     sessionIdleMs: intEnv("SESSION_IDLE_MS", 5 * 60_000, 0, 24 * 60 * 60_000),

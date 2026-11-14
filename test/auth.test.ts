@@ -62,6 +62,21 @@ test("requires CLAUDE_CODE_OAUTH_TOKEN", () => {
   assert.equal(config.proxyApiKey, "proxy");
   assert.ok(config.claudeConfigDir.endsWith(".claude"));
   assert.equal(config.claudeConfigDirExplicit, false);
+  assert.equal(config.systemPromptMode, "claude-code");
+
+  const full = loadConfig({
+    PROXY_API_KEY: "proxy",
+    CLAUDE_CODE_OAUTH_TOKEN: "token",
+    SYSTEM_PROMPT_MODE: "full",
+  });
+  assert.equal(full.systemPromptMode, "full");
+
+  const unknown = loadConfig({
+    PROXY_API_KEY: "proxy",
+    CLAUDE_CODE_OAUTH_TOKEN: "token",
+    SYSTEM_PROMPT_MODE: "nonsense",
+  });
+  assert.equal(unknown.systemPromptMode, "claude-code");
 
   const explicit = loadConfig({
     PROXY_API_KEY: "proxy",

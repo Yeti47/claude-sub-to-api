@@ -28,5 +28,6 @@ services:
       # A neutral, stable working directory keeps the harness context out of
       # the repository and makes the cached system prompt reusable.
       CLAUDE_CWD: "/data/workspace"
+      SYSTEM_PROMPT_MODE: "${SYSTEM_PROMPT_MODE:-claude-code}"
     volumes:
       - ~/.config/claude-sub-to-api:/data

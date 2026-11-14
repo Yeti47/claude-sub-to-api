@@ -17,6 +17,7 @@ const config: Config = {
   maxConcurrency: 1,
   requestTimeoutMs: 60_000,
   defaultMaxTokens: 100,
+  systemPromptMode: "claude-code",
   parkedTurnTtlMs: 0,
   sessionIdleMs: 0,
   parkedEvictableAfterMs: 0,
@@ -71,13 +72,18 @@ test("runs a text turn and configures a constrained SDK session", async () => {
     type?: string;
     preset?: string;
     excludeDynamicSections?: boolean;
+    snapshot?: boolean;
     append?: string;
   };
   assert.equal(systemPrompt.type, "preset");
   assert.equal(systemPrompt.preset, "claude_code");
   assert.equal(systemPrompt.excludeDynamicSections, true);
+  assert.equal(systemPrompt.snapshot, false);
   assert.match(systemPrompt.append ?? "", /claude-sub-to-api/);
-  assert.match(systemPrompt.append ?? "", /Be brief\./);
+  assert.match(systemPrompt.append ?? "", /Mention this only when asked/);
+  assert.doesNotMatch(systemPrompt.append ?? "", /Anthropic-compatible HTTP API/);
+  assert.doesNotMatch(systemPrompt.append ?? "", /Be brief\./);
+  assert.doesNotMatch(systemPrompt.append ?? "", /API client instructions/);
   assert.deepEqual(options?.tools, []);
   assert.equal(options?.permissionMode, "dontAsk");
   assert.equal(options?.maxTurns, undefined);
@@ -102,6 +108,32 @@ test("runs a text turn and configures a constrained SDK session", async () => {
   assert.equal(env.CLAUDE_CODE_EFFORT_LEVEL, undefined);
   assert.equal(env.MCP_TOOL_TIMEOUT, undefined);
   assert.deepEqual(options?.thinking, { type: "disabled" });
+});
+
+test("full system prompt mode appends the client's instructions", async () => {
+  let options: Record<string, unknown> | undefined;
+  const runner = new ClaudeRunner(
+    { ...config, systemPromptMode: "full" },
+    createLogger("error"),
+    fakeQuery(textEvents, (value) => (options = value)) as never,
+  );
+  await runner.run({
+    request: {
+      model: "claude-sonnet-5-5",
+      max_tokens: 16,
+      system: "Be brief.",
+      messages: [{ role: "user", content: "hi" }],
+    },
+    conversationKey: "full-prompt",
+    signal: new AbortController().signal,
+    requestId: "r-full",
+    stream: false,
+  });
+
+  const systemPrompt = options?.systemPrompt as { append?: string };
+  assert.match(systemPrompt.append ?? "", /# API client instructions/);
+  assert.match(systemPrompt.append ?? "", /Be brief\./);
+  assert.match(systemPrompt.append ?? "", /Mention this only when asked/);
 });
 
 function persistentQuery(received: string[], counter: { calls: number }) {

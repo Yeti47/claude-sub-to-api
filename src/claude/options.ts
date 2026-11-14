@@ -1,5 +1,5 @@
 /** Agent SDK options for one Claude process, built from a Messages API request. */
-import type { Config } from "../config.js";
+import type { Config, SystemPromptMode } from "../config.js";
 import type { MessagesRequest } from "../anthropic/types.js";
 import type { PreparedTurn } from "../anthropic/translate.js";
 import type { ToolBridge } from "../anthropic/tools.js";
@@ -18,23 +18,24 @@ function thinkingOption(request: MessagesRequest, maxTokens: number): Record<str
   };
 }
 
-const RUNTIME_NOTE = [
-  "<runtime_info>",
-  "You are running in claude-sub-to-api, an Anthropic-compatible HTTP API backed by a Claude subscription, through the Claude Code harness.",
-  "The built-in Claude Code tools (Bash, Read, Edit, and so on) are disabled. The only tools available are the ones defined in this request; they are provided by the API client, which executes them, and their results come back in a later message.",
-  "If you are asked what you are running in, say this plainly. Do not claim to be Claude Code itself, and do not imply the API client is Claude Code.",
-  "</runtime_info>",
-].join("\n");
+/**
+ * One line, the same shape Claude Code hosts such as OpenCode use. It names
+ * the proxy so the model does not claim to be Claude Code, without turning the
+ * harness prompt into a description of a third-party API.
+ */
+const RUNTIME_NOTE =
+  "<runtime_info>You are running in claude-sub-to-api through the Claude Code harness. Mention this only when asked.</runtime_info>";
 
-function systemPromptOption(clientSystem: string | undefined): Record<string, unknown> {
-  const append = [
-    RUNTIME_NOTE,
-    clientSystem
-      ? `# API client instructions\n\nThe API client that sent this request supplied the following instructions. Follow them for this turn; they take precedence over the harness's coding-specific guidance.\n\n${clientSystem}`
-      : "",
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+function systemPromptOption(
+  clientSystem: string | undefined,
+  mode: SystemPromptMode,
+): Record<string, unknown> {
+  const append = [RUNTIME_NOTE];
+  if (mode === "full" && clientSystem) {
+    append.push(
+      `# API client instructions\n\nThe API client that sent this request supplied the following instructions. Follow them for this turn; they take precedence over the harness's coding-specific guidance.\n\n${clientSystem}`,
+    );
+  }
 
   return {
     type: "preset",
@@ -42,7 +43,11 @@ function systemPromptOption(clientSystem: string | undefined): Record<string, un
     // Keeps cwd, memory path and git status out of the system prompt, so it
     // stays stable across sessions and can be read from the prompt cache.
     excludeDynamicSections: true,
-    append,
+    // Like the Claude Code hosts, render the prompt on every request instead
+    // of recording it in the session, so a prompt change (or a switch of
+    // SYSTEM_PROMPT_MODE) applies without waiting for compaction.
+    snapshot: false,
+    append: append.join("\n\n"),
   };
 }
 
@@ -140,7 +145,7 @@ export function queryOptions(input: QueryOptionsInput): Record<string, unknown> 
     settings: { disableAllHooks: true },
     abortController: input.controller,
     stderr: input.onStderr,
-    systemPrompt: systemPromptOption(prepared.system),
+    systemPrompt: systemPromptOption(prepared.system, config.systemPromptMode),
   };
   const effort = request.output_config?.effort;
   if (

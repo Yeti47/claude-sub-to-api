@@ -86,6 +86,7 @@ async function main(): Promise<void> {
     addr: address ? `${address.address}:${address.port}` : config.listenAddr,
     configDir: config.claudeConfigDir,
     maxConcurrency: config.maxConcurrency,
+    systemPromptMode: config.systemPromptMode,
   });
 
   let shuttingDown = false;
