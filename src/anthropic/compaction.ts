@@ -49,8 +49,9 @@ export function validateCompaction(request: MessagesRequest): string | null {
 
   let blocks = 0;
   let unanswered = new Set<string>();
-  for (const message of request.messages) {
-    if (message.role === "assistant") unanswered = new Set();
+  for (const [index, message] of request.messages.entries()) {
+    if (message.role === "assistant" && request.messages[index - 1]?.role !== "assistant")
+      unanswered = new Set();
     for (const block of contentBlocks(message.content)) {
       if (block.type === "compaction") blocks += 1;
       else if (block.type === "tool_use") unanswered.add(block.id);
