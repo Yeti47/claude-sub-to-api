@@ -14,7 +14,7 @@
  * conversations that happen to share a key still find their own sessions.
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { Message } from "../anthropic/types.js";
 import { hasToolResult, historyFingerprint, historyPrefixHashes } from "./hashes.js";
@@ -47,6 +47,11 @@ interface SessionEntry extends SessionScope {
 
 interface StateFile {
   version: 2;
+  /**
+   * False while the proxy runs, true once it has shut down in order. A file
+   * left at false may lack the last changes, so its tips are not trusted.
+   */
+  clean?: boolean;
   sessions: Record<string, SessionEntry>;
 }
 
@@ -94,17 +99,25 @@ export class SessionStore {
   private written = 0;
   private saveTimer: ReturnType<typeof setTimeout> | undefined;
   private writing: Promise<void> | undefined;
+  /** Whether the file on disk is marked as left by an orderly shutdown. */
+  private diskClean = true;
 
   /**
    * @param onPruned Called for a session dropped for age or to stay within
    *   the session limit, so its transcript can be deleted.
+   * @param isLive Whether a Claude process still holds the session. Such a
+   *   session is not pruned: its transcript is still being written.
    */
   constructor(
     private readonly path: string | undefined,
     private readonly logger: Logger,
     private readonly onPruned?: (sessionId: string, cwd: string) => void,
+    private readonly isLive?: (sessionId: string) => boolean,
   ) {
     this.load();
+    // Changes reach the disk a moment after they happen. Marking the file
+    // first means a crash inside that moment is noticed on the next start.
+    if (this.sessions.size > 0) this.writeNow(false);
   }
 
   private load(): void {
@@ -118,8 +131,15 @@ export class SessionStore {
           : migrateBindings(parsed as Record<string, LegacyBinding>);
       // Oldest first, so the newest session wins a shared checkpoint.
       sessions.sort(([, a], [, b]) => a.updatedAt - b.updatedAt);
+      // After a crash a resumed turn's claim may never have been written,
+      // and its transcript may end in a partial exchange: fork, do not resume.
+      const crashed = (parsed as StateFile).clean === false;
+      if (crashed) {
+        this.logger.info("session state was not closed in order; sessions fork on next use");
+      }
       for (const [sessionId, entry] of sessions) {
         if (!validEntry(entry)) continue;
+        if (crashed) entry.tip = "";
         this.sessions.set(sessionId, entry);
         for (const checkpoint of entry.checkpoints) this.addToIndex(sessionId, entry, checkpoint);
       }
@@ -147,8 +167,8 @@ export class SessionStore {
     this.saveTimer.unref?.();
   }
 
-  private serialize(): string {
-    const file: StateFile = { version: 2, sessions: Object.fromEntries(this.sessions) };
+  private serialize(clean: boolean): string {
+    const file: StateFile = { version: 2, clean, sessions: Object.fromEntries(this.sessions) };
     return `${JSON.stringify(file)}\n`;
   }
 
@@ -156,18 +176,20 @@ export class SessionStore {
     const path = this.path;
     if (!path || this.writing || this.written >= this.revision) return;
     const revision = this.revision;
-    const data = this.serialize();
+    const data = this.serialize(false);
     const tmp = `${path}.tmp`;
     this.writing = (async () => {
       await mkdir(dirname(path), { recursive: true });
       await writeFile(tmp, data, "utf8");
-      // flush() may have written a newer revision in the meantime.
+      // flush() may have written a newer revision in the meantime. Checking
+      // and publishing in one synchronous step keeps it from being undone.
       if (this.written >= revision) {
         await rm(tmp, { force: true });
         return;
       }
-      await rename(tmp, path);
+      renameSync(tmp, path);
       this.written = revision;
+      this.diskClean = false;
     })();
     try {
       await this.writing;
@@ -180,19 +202,25 @@ export class SessionStore {
     }
   }
 
-  /** Write pending changes now. Synchronous, for shutdown. */
+  /** Write pending changes now and mark the state as closed in order. For shutdown. */
   flush(): void {
     if (this.saveTimer) {
       clearTimeout(this.saveTimer);
       this.saveTimer = undefined;
     }
-    if (!this.path || this.written >= this.revision) return;
+    if (this.written >= this.revision && this.diskClean) return;
+    this.writeNow(true);
+  }
+
+  private writeNow(clean: boolean): void {
+    if (!this.path) return;
     try {
       mkdirSync(dirname(this.path), { recursive: true });
       const tmp = `${this.path}.flush.tmp`;
-      writeFileSync(tmp, this.serialize(), "utf8");
+      writeFileSync(tmp, this.serialize(clean), "utf8");
       renameSync(tmp, this.path);
       this.written = this.revision;
+      this.diskClean = clean;
     } catch (error) {
       this.logger.warn("could not write session state", {
         path: this.path,
@@ -262,7 +290,8 @@ export class SessionStore {
     if (decision.kind === "resume") {
       session.tip = "";
       // Persisted shortly after, so a turn that dies mid-way still forks after
-      // a restart instead of resuming a transcript with a partial exchange.
+      // a restart instead of resuming a transcript with a partial exchange. A
+      // crash before that write is caught by the file's `clean` mark.
       this.save();
     }
   }
@@ -359,6 +388,7 @@ export class SessionStore {
   private prune(): void {
     if (this.sessions.size <= MAX_SESSIONS) return;
     const oldest = [...this.sessions.entries()]
+      .filter(([sessionId]) => !this.isLive?.(sessionId))
       .sort(([, a], [, b]) => a.updatedAt - b.updatedAt)
       .slice(0, this.sessions.size - MAX_SESSIONS);
     for (const [sessionId, session] of oldest) {

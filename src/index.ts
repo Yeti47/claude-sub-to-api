@@ -46,14 +46,19 @@ async function main(): Promise<void> {
     (config.claudeConfigDir ? join(config.claudeConfigDir, "sub-to-api-sessions.json") : undefined);
   // A session the store no longer tracks can never be resumed or forked, so
   // its transcript is only taking up disk space.
-  const sessions = new SessionStore(statePath, logger, (sessionId, cwd) => {
-    deleteSession(sessionId, { dir: cwd }).catch((error: unknown) => {
-      logger.debug("could not delete a pruned session transcript", {
-        sessionId,
-        error: String(error),
+  const sessions = new SessionStore(
+    statePath,
+    logger,
+    (sessionId, cwd) => {
+      deleteSession(sessionId, { dir: cwd }).catch((error: unknown) => {
+        logger.debug("could not delete a pruned session transcript", {
+          sessionId,
+          error: String(error),
+        });
       });
-    });
-  });
+    },
+    (sessionId) => runner.isLive(sessionId),
+  );
   const handler = createHandler({ config, logger, runner, models, auth, sessions });
 
   const server = createServer((req, res) => {

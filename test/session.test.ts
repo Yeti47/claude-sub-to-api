@@ -394,6 +394,40 @@ test("a claim survives a restart", () => {
   assert.equal(plan(new SessionStore(path, logger), messages).kind, "fork");
 });
 
+test("a state file left by a crash is not resumed from", () => {
+  const path = tempPath();
+  const crashed = new SessionStore(path, logger);
+  const first = [u("one"), a("reply")];
+  const messages = [...first, u("two")];
+  record(crashed, first, "s1", "leaf-1");
+  crashed.flush();
+
+  // A restart that resumes the session and dies before the claim is written.
+  const running = new SessionStore(path, logger);
+  assert.equal(plan(running, messages).kind, "resume");
+  assert.equal(plan(new SessionStore(path, logger), messages).kind, "fork");
+
+  // An orderly shutdown keeps the session resumable.
+  const closed = new SessionStore(path, logger);
+  record(closed, first, "s1", "leaf-1");
+  closed.flush();
+  assert.equal(plan(new SessionStore(path, logger), messages).kind, "resume");
+});
+
+test("a session a process still holds is not pruned", () => {
+  const pruned: string[] = [];
+  const sessions = new SessionStore(
+    undefined,
+    logger,
+    (sessionId) => pruned.push(sessionId),
+    (sessionId) => sessionId === "s0",
+  );
+  for (let index = 0; index <= 300; index += 1) {
+    record(sessions, [u(`question ${index}`), a("reply")], `s${index}`, "leaf");
+  }
+  assert.deepEqual(pruned, ["s1"]);
+});
+
 test("reports sessions dropped for the session limit or for age", () => {
   const pruned: string[] = [];
   const sessions = new SessionStore(undefined, logger, (sessionId) => pruned.push(sessionId));

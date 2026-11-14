@@ -296,6 +296,14 @@ test("estimates input tokens without running a turn", async () => {
       assert.ok(large.json.input_tokens! > 1800 && large.json.input_tokens! < 2000);
 
       assert.equal((await count({ model: "claude-sonnet-5-5", messages: [] })).status, 400);
+      // Blocks the estimate cannot read are refused, not answered with 200.
+      for (const block of [{ type: "text" }, { type: "text", text: 7 }]) {
+        const malformed = await count({
+          model: "claude-sonnet-5-5",
+          messages: [{ role: "user", content: [block] }],
+        });
+        assert.equal(malformed.status, 400);
+      }
       assert.equal(
         (await fetch(`${base}/v1/messages/count_tokens`, { method: "POST", body: "{}" })).status,
         401,

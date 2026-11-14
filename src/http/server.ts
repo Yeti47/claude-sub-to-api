@@ -95,8 +95,19 @@ export function createHandler(deps: Deps) {
     if (invalid) return sendError(res, 400, "invalid_request_error", invalid);
 
     if (counting) {
+      // Estimated before the status line: validation is shallower than the
+      // estimate, which reads every block.
+      let inputTokens: number;
+      try {
+        inputTokens = estimateInputTokens(request);
+      } catch {
+        inputTokens = Number.NaN;
+      }
+      if (!Number.isFinite(inputTokens)) {
+        return sendError(res, 400, "invalid_request_error", "messages contain a malformed content block");
+      }
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ input_tokens: estimateInputTokens(request) }));
+      res.end(JSON.stringify({ input_tokens: inputTokens }));
       return;
     }
 

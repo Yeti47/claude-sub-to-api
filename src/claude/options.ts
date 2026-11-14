@@ -46,7 +46,8 @@ function systemPromptOption(clientSystem: string | undefined): Record<string, un
   };
 }
 
-export function childEnv(config: Config, maxTokens: number): Record<string, string> {
+/** The environment every Claude Code child starts from. */
+export function baseEnv(config: Config): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (value !== undefined) env[key] = value;
@@ -56,6 +57,13 @@ export function childEnv(config: Config, maxTokens: number): Record<string, stri
   } else {
     delete env.CLAUDE_CONFIG_DIR;
   }
+  // The key API clients present to this proxy is no business of the CLI.
+  delete env.PROXY_API_KEY;
+  return env;
+}
+
+export function childEnv(config: Config, maxTokens: number): Record<string, string> {
+  const env = baseEnv(config);
   env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(maxTokens);
   env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
   env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
@@ -79,8 +87,6 @@ export function childEnv(config: Config, maxTokens: number): Record<string, stri
   // model messages for one API request, which cannot be represented as one
   // Anthropic response (especially in a stream).
   if (!env.CLAUDE_CODE_MAX_RETRIES) env.CLAUDE_CODE_MAX_RETRIES = "0";
-  // The key API clients present to this proxy is no business of the CLI.
-  delete env.PROXY_API_KEY;
   // The CLI is driven by an API client, not a terminal user.
   delete env.ANTHROPIC_API_KEY;
   delete env.ANTHROPIC_AUTH_TOKEN;

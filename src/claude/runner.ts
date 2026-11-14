@@ -200,6 +200,11 @@ export class ClaudeRunner {
     return parked?.key ?? input.conversationKey;
   }
 
+  /** Whether a process still holds this session's transcript. */
+  isLive(sessionId: string): boolean {
+    return [...this.processes].some((process) => process.sessionId === sessionId);
+  }
+
   closeAll(reason = "Server shutting down"): void {
     for (const process of [...this.processes]) process.close(reason);
   }
