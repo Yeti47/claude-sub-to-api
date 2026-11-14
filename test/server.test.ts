@@ -258,3 +258,65 @@ test("a stream that fails after it started reports the error as an event", async
     },
   );
 });
+
+test("estimates input tokens without running a turn", async () => {
+  let runs = 0;
+  await withServer(
+    async (base) => {
+      const count = async (payload: Record<string, unknown>) => {
+        const res = await fetch(`${base}/v1/messages/count_tokens`, {
+          method: "POST",
+          headers: { "x-api-key": "secret", "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        return { status: res.status, json: (await res.json()) as { input_tokens?: number } };
+      };
+      const small = await count({
+        model: "claude-sonnet-5-5",
+        messages: [{ role: "user", content: "x".repeat(300) }],
+      });
+      assert.equal(small.status, 200);
+      assert.equal(small.json.input_tokens, 104);
+
+      const large = await count({
+        model: "claude-sonnet-5-5",
+        system: "y".repeat(300),
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "x".repeat(300) },
+              { type: "image", source: { type: "base64", media_type: "image/png", data: "A".repeat(90_000) } },
+            ],
+          },
+        ],
+        tools: [{ name: "lookup", description: "Look something up", input_schema: { type: "object" } }],
+      });
+      // The image counts as an image, not as 90,000 characters of text.
+      assert.ok(large.json.input_tokens! > 1800 && large.json.input_tokens! < 2000);
+
+      assert.equal((await count({ model: "claude-sonnet-5-5", messages: [] })).status, 400);
+      // Blocks the estimate cannot read are refused, not answered with 200.
+      for (const block of [{ type: "text" }, { type: "text", text: 7 }]) {
+        const malformed = await count({
+          model: "claude-sonnet-5-5",
+          messages: [{ role: "user", content: [block] }],
+        });
+        assert.equal(malformed.status, 400);
+      }
+      assert.equal(
+        (await fetch(`${base}/v1/messages/count_tokens`, { method: "POST", body: "{}" })).status,
+        401,
+      );
+    },
+    {
+      runner: {
+        run: async () => {
+          runs += 1;
+          throw new Error("must not run");
+        },
+      } as never,
+    },
+  );
+  assert.equal(runs, 0);
+});

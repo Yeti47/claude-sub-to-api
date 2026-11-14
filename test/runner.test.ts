@@ -1187,3 +1187,52 @@ test("a rate limit with a known reset time carries retry-after", () => {
   assert.ok(error.retryAfter !== undefined && error.retryAfter >= 89 && error.retryAfter <= 90);
   assert.equal(errorFor({ type: "rate_limit", message: "limit" }).retryAfter, undefined);
 });
+
+test("tool results sent with another system prompt do not continue the parked turn", async () => {
+  const { runner, state, run } = toolRunner(["t1"]);
+  await run("r1", undefined);
+  const parked = state.pending!;
+
+  const second = await run("r2", undefined, {
+    request: {
+      model: "claude-sonnet-5-5",
+      messages: [
+        { role: "user", content: "find x" },
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "lookup", input: { q: "x" } }] },
+        toolResultMessage(["t1"]),
+      ],
+      system: "A different prompt.",
+      tools: [lookupTool],
+    },
+  });
+  assert.deepEqual(parked.pendingIds(), []);
+  assert.equal(state.calls, 2);
+  assert.equal(second.reused, undefined);
+  runner.closeAll();
+});
+
+test("the proxy's own API key is not passed to the Claude process", async () => {
+  process.env.PROXY_API_KEY = "proxy-secret";
+  let env: Record<string, string> | undefined;
+  const runner = new ClaudeRunner(
+    config,
+    createLogger("error"),
+    fakeQuery(textEvents, (options) => {
+      env = options.env as Record<string, string>;
+    }) as never,
+  );
+  try {
+    await runner.run({
+      conversationKey: "conv",
+      request: { model: "m", messages: [{ role: "user", content: "hi" }] },
+      signal: new AbortController().signal,
+      requestId: "env",
+      stream: false,
+    });
+  } finally {
+    delete process.env.PROXY_API_KEY;
+  }
+  assert.ok(env);
+  assert.equal(env.PROXY_API_KEY, undefined);
+  runner.closeAll();
+});

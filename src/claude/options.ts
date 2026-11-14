@@ -46,7 +46,8 @@ function systemPromptOption(clientSystem: string | undefined): Record<string, un
   };
 }
 
-function childEnv(config: Config, maxTokens: number): Record<string, string> {
+/** The environment every Claude Code child starts from. */
+export function baseEnv(config: Config): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (value !== undefined) env[key] = value;
@@ -56,6 +57,13 @@ function childEnv(config: Config, maxTokens: number): Record<string, string> {
   } else {
     delete env.CLAUDE_CONFIG_DIR;
   }
+  // The key API clients present to this proxy is no business of the CLI.
+  delete env.PROXY_API_KEY;
+  return env;
+}
+
+export function childEnv(config: Config, maxTokens: number): Record<string, string> {
+  const env = baseEnv(config);
   env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(maxTokens);
   env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = "1";
   env.CLAUDE_CODE_DISABLE_CLAUDE_MDS = "1";
@@ -182,6 +190,19 @@ export function launchKey(config: Config, request: MessagesRequest, prepared: Pr
     effort: request.output_config?.effort ?? null,
     cwd: config.cwd,
     configDir: config.claudeConfigDir,
+  });
+}
+
+/**
+ * What a turn in flight cannot change: the model, system prompt and tools it
+ * was started with. Tool results only continue a parked turn with the same
+ * identity.
+ */
+export function turnIdentity(request: MessagesRequest, prepared: PreparedTurn): string {
+  return stableStringify({
+    model: request.model,
+    system: prepared.system ?? null,
+    tools: prepared.tools,
   });
 }
 

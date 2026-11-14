@@ -10,6 +10,7 @@ import { ApiError, ClientAbort, ClaudeRunner, type RunResult } from "../claude/r
 import type { ModelCatalog } from "../claude/models.js";
 import type { SessionStore, ResumeDecision } from "../session/store.js";
 import { deriveConversationKey, systemHash } from "../session/hashes.js";
+import { estimateInputTokens } from "../anthropic/count.js";
 import { SseWriter } from "./sse.js";
 
 const MAX_BODY = 32 << 20;
@@ -54,7 +55,8 @@ export function createHandler(deps: Deps) {
       return;
     }
 
-    if (path !== "/v1/messages" && path !== "/v1/models") {
+    const counting = path === "/v1/messages/count_tokens";
+    if (path !== "/v1/messages" && path !== "/v1/models" && !counting) {
       return sendError(res, 404, "not_found_error", `Unknown endpoint ${path}`);
     }
 
@@ -91,6 +93,23 @@ export function createHandler(deps: Deps) {
     const request = body as MessagesRequest;
     const invalid = validate(request);
     if (invalid) return sendError(res, 400, "invalid_request_error", invalid);
+
+    if (counting) {
+      // Estimated before the status line: validation is shallower than the
+      // estimate, which reads every block.
+      let inputTokens: number;
+      try {
+        inputTokens = estimateInputTokens(request);
+      } catch {
+        inputTokens = Number.NaN;
+      }
+      if (!Number.isFinite(inputTokens)) {
+        return sendError(res, 400, "invalid_request_error", "messages contain a malformed content block");
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ input_tokens: inputTokens }));
+      return;
+    }
 
     const stream = request.stream === true;
     const controller = new AbortController();

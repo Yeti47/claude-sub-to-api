@@ -76,7 +76,7 @@ export function loadConfig(envVars: NodeJS.ProcessEnv = process.env): Config {
   const explicitConfigDir = envVars.CLAUDE_CONFIG_DIR?.trim();
 
   return {
-    listenAddr: envVars.LISTEN_ADDR?.trim() || ":8080",
+    listenAddr: envVars.LISTEN_ADDR?.trim() || "127.0.0.1:8080",
     proxyApiKey,
     claudeConfigDir: explicitConfigDir || join(homedir(), ".claude"),
     claudeConfigDirExplicit: Boolean(explicitConfigDir),

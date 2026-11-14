@@ -2,6 +2,7 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { Config } from "../config.js";
 import { errorMessage, type Logger } from "../logger.js";
+import { baseEnv } from "./options.js";
 
 export interface ModelRow {
   type: "model";
@@ -58,15 +59,7 @@ export class ModelCatalog {
   }
 
   private async fetchFromCli(timeoutMs: number): Promise<ModelRow[]> {
-    const env: Record<string, string> = {};
-    for (const [key, value] of Object.entries(process.env)) {
-      if (value !== undefined) env[key] = value;
-    }
-    if (this.config.claudeConfigDirExplicit) {
-      env.CLAUDE_CONFIG_DIR = this.config.claudeConfigDir;
-    } else {
-      delete env.CLAUDE_CONFIG_DIR;
-    }
+    const env = baseEnv(this.config);
 
     let release: () => void = () => {};
     const idle = (async function* () {

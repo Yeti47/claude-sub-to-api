@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionStore, type Checkpoint } from "../src/session/store.js";
@@ -48,7 +48,11 @@ function plan(sessions: SessionStore, messages: Message[], extra: Partial<typeof
   return sessions.plan({ ...base, ...extra, messages });
 }
 
-function saved(path: string): Record<string, { tip: string; checkpoints: Checkpoint[] }> {
+function saved(
+  sessions: SessionStore,
+  path: string,
+): Record<string, { tip: string; checkpoints: Checkpoint[] }> {
+  sessions.flush();
   return (JSON.parse(readFileSync(path, "utf8")) as { sessions: never }).sessions;
 }
 
@@ -240,7 +244,7 @@ test("records and replaces a checkpoint for the same history", () => {
   const history = [u("one"), a("reply")];
   record(sessions, history, "s1", "leaf-1");
   record(sessions, history, "s1", "leaf-2");
-  assert.deepEqual(saved(path).s1?.checkpoints, [checkpoint(history, "leaf-2")]);
+  assert.deepEqual(saved(sessions, path).s1?.checkpoints, [checkpoint(history, "leaf-2")]);
 });
 
 test("a parked tool turn moves the session past its last checkpoint", () => {
@@ -251,8 +255,8 @@ test("a parked tool turn moves the session past its last checkpoint", () => {
 
   const parked = [...first, u("two"), a("tool")];
   record(sessions, parked, "s1", "leaf-2", { parked: true });
-  assert.deepEqual(saved(path).s1?.checkpoints, [checkpoint(first, "leaf-1")]);
-  assert.equal(saved(path).s1?.tip, "");
+  assert.deepEqual(saved(sessions, path).s1?.checkpoints, [checkpoint(first, "leaf-1")]);
+  assert.equal(saved(sessions, path).s1?.tip, "");
 
   // With the parked turn gone, the tool exchange is replayed into a fork.
   assert.deepEqual(plan(sessions, [...parked, toolResult]), {
@@ -293,18 +297,6 @@ test("forgetting one of two sessions with the same history keeps the other", () 
   assert.deepEqual(plan(sessions, [...first, u("two")]), { kind: "fresh" });
 });
 
-test("a claim is written to disk", () => {
-  const path = tempPath();
-  const sessions = new SessionStore(path, logger);
-  const first = [u("one"), a("reply")];
-  const messages = [...first, u("two")];
-  record(sessions, first, "s1", "leaf-1");
-  sessions.claim(plan(sessions, messages));
-
-  // After a restart mid-turn the session is forked, not resumed.
-  assert.equal(plan(new SessionStore(path, logger), messages).kind, "fork");
-});
-
 test("a forgotten session no longer matches", () => {
   const sessions = store();
   const first = [u("one"), a("reply")];
@@ -319,6 +311,7 @@ test("reloads sessions from disk", () => {
   const one = [u("one"), a("reply")];
   record(first, one, "s1", "leaf-1");
   record(first, [...one, u("two"), a("reply")], "s1", "leaf-2");
+  first.flush();
 
   const second = new SessionStore(path, logger);
   assert.equal(plan(second, [...one, u("two"), a("reply"), u("three")]).kind, "resume");
@@ -373,4 +366,81 @@ test("derives a stable key from the header, metadata, or first user turn", () =>
     `first:${userMessageHashes(messages)[0]}`,
   );
   assert.equal(deriveConversationKey(messages), deriveConversationKey(messages));
+});
+
+test("writes changes to disk on its own, after a short delay", async () => {
+  const path = tempPath();
+  const sessions = new SessionStore(path, logger);
+  const first = [u("one"), a("reply")];
+  record(sessions, first, "s1", "leaf-1");
+  record(sessions, [...first, u("two"), a("reply")], "s1", "leaf-2");
+  assert.equal(existsSync(path), false);
+
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  const file = JSON.parse(readFileSync(path, "utf8")) as { sessions: Record<string, { checkpoints: unknown[] }> };
+  assert.equal(file.sessions.s1?.checkpoints.length, 2);
+  assert.equal(existsSync(`${path}.tmp`), false);
+});
+
+test("a claim survives a restart", () => {
+  const path = tempPath();
+  const sessions = new SessionStore(path, logger);
+  const first = [u("one"), a("reply")];
+  const messages = [...first, u("two")];
+  record(sessions, first, "s1", "leaf-1");
+  sessions.claim(plan(sessions, messages));
+  sessions.flush();
+
+  assert.equal(plan(new SessionStore(path, logger), messages).kind, "fork");
+});
+
+test("a state file left by a crash is not resumed from", () => {
+  const path = tempPath();
+  const crashed = new SessionStore(path, logger);
+  const first = [u("one"), a("reply")];
+  const messages = [...first, u("two")];
+  record(crashed, first, "s1", "leaf-1");
+  crashed.flush();
+
+  // A restart that resumes the session and dies before the claim is written.
+  const running = new SessionStore(path, logger);
+  assert.equal(plan(running, messages).kind, "resume");
+  assert.equal(plan(new SessionStore(path, logger), messages).kind, "fork");
+
+  // An orderly shutdown keeps the session resumable.
+  const closed = new SessionStore(path, logger);
+  record(closed, first, "s1", "leaf-1");
+  closed.flush();
+  assert.equal(plan(new SessionStore(path, logger), messages).kind, "resume");
+});
+
+test("a session a process still holds is not pruned", () => {
+  const pruned: string[] = [];
+  const sessions = new SessionStore(
+    undefined,
+    logger,
+    (sessionId) => pruned.push(sessionId),
+    (sessionId) => sessionId === "s0",
+  );
+  for (let index = 0; index <= 300; index += 1) {
+    record(sessions, [u(`question ${index}`), a("reply")], `s${index}`, "leaf");
+  }
+  assert.deepEqual(pruned, ["s1"]);
+});
+
+test("reports sessions dropped for the session limit or for age", () => {
+  const pruned: string[] = [];
+  const sessions = new SessionStore(undefined, logger, (sessionId) => pruned.push(sessionId));
+  for (let index = 0; index <= 300; index += 1) {
+    record(sessions, [u(`question ${index}`), a("reply")], `s${index}`, "leaf");
+  }
+  assert.equal(pruned.length, 1);
+
+  const old = [u("old"), a("reply")];
+  record(sessions, old, "aged", "leaf");
+  const later = Date.now() + 31 * 24 * 60 * 60_000;
+  assert.deepEqual(sessions.plan({ ...base, messages: [...old, u("next")], now: later }), {
+    kind: "fresh",
+  });
+  assert.ok(pruned.includes("aged"));
 });

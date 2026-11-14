@@ -47,7 +47,13 @@ import {
   isMissingSession,
   isMissingTranscript,
 } from "./errors.js";
-import { launchKey, queryOptions, stableStringify, wantsThinking } from "./options.js";
+import {
+  launchKey,
+  queryOptions,
+  stableStringify,
+  turnIdentity,
+  wantsThinking,
+} from "./options.js";
 import type { ResumeDecision } from "../session/store.js";
 
 export { ApiError, ClientAbort } from "./errors.js";
@@ -194,6 +200,11 @@ export class ClaudeRunner {
     return parked?.key ?? input.conversationKey;
   }
 
+  /** Whether a process still holds this session's transcript. */
+  isLive(sessionId: string): boolean {
+    return [...this.processes].some((process) => process.sessionId === sessionId);
+  }
+
   closeAll(reason = "Server shutting down"): void {
     for (const process of [...this.processes]) process.close(reason);
   }
@@ -203,7 +214,23 @@ export class ClaudeRunner {
 
     const toolResults = lastToolResults(input.request.messages);
     const parked = this.findParked([...toolResults.results.keys()]);
-    if (parked) return this.continueParked(parked, input, toolResults);
+    if (parked) {
+      // Only the final message matters here; the history is already in the turn.
+      const prepared = prepareTurn(input.request, {
+        resumeFromIndex: input.request.messages.length - 1,
+      });
+      if (parked.identity === turnIdentity(input.request, prepared)) {
+        return this.continueParked(parked, input, toolResults);
+      }
+      // The client changed the model, system prompt or tools between the
+      // tool call and its results. The parked turn would answer with the old
+      // ones, so it is dropped and the request is planned like any other.
+      this.logger.warn("tool results do not match the parked turn's configuration", {
+        requestId: input.requestId,
+        sessionId: parked.sessionId,
+      });
+      parked.close("Configuration changed before the tool results arrived");
+    }
 
     // The client moved past a tool call without answering it in its final
     // message, so the turn waiting for that answer is dead. Other parked
@@ -444,6 +471,7 @@ export class ClaudeRunner {
         key: input.conversationKey,
         model: request.model,
         launchKey: launch.launchKey,
+        identity: turnIdentity(request, launch.prepared),
         includeThinking: wantsThinking(request),
         bridge,
         pending,

@@ -8,8 +8,10 @@ services:
     # Run as the host user so the bind-mounted Claude config directory (the
     # onboarding file and session transcripts) is writable.
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    # Published on loopback only. To serve other machines, put a TLS reverse
+    # proxy in front, or change this to "8080:8080" on a trusted network.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       LISTEN_ADDR: ":8080"
       PROXY_API_KEY: ${PROXY_API_KEY:?set PROXY_API_KEY in .env}
@@ -21,6 +23,8 @@ services:
       REQUEST_TIMEOUT_MS: "900000"
       SESSION_IDLE_MS: "${SESSION_IDLE_MS:-300000}"
       PARKED_TURN_TTL_MS: "${PARKED_TURN_TTL_MS:-1800000}"
+      PARKED_EVICTABLE_AFTER_MS: "${PARKED_EVICTABLE_AFTER_MS:-60000}"
+      QUEUE_TIMEOUT_MS: "${QUEUE_TIMEOUT_MS:-30000}"
       # A neutral, stable working directory keeps the harness context out of
       # the repository and makes the cached system prompt reusable.
       CLAUDE_CWD: "/data/workspace"

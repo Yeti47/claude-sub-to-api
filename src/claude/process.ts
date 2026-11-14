@@ -28,6 +28,7 @@ export interface LiveProcessInit {
   key: string;
   model: string;
   launchKey: string;
+  identity: string;
   includeThinking: boolean;
   bridge: ToolBridge | undefined;
   pending: PendingToolRegistry;
@@ -44,6 +45,8 @@ export class LiveProcess {
   key: string;
   readonly model: string;
   readonly launchKey: string;
+  /** Model, system prompt and tools of the turns this process runs. */
+  readonly identity: string;
   readonly includeThinking: boolean;
   readonly bridge: ToolBridge | undefined;
   readonly pending: PendingToolRegistry;
@@ -62,6 +65,7 @@ export class LiveProcess {
     this.key = init.key;
     this.model = init.model;
     this.launchKey = init.launchKey;
+    this.identity = init.identity;
     this.includeThinking = init.includeThinking;
     this.bridge = init.bridge;
     this.pending = init.pending;
