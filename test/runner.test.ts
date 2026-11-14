@@ -563,39 +563,47 @@ function toolResultMessage(ids: string[], text?: string) {
  * A process whose first message calls `lookup` once per id and then blocks,
  * like the CLI does, until every handler has its result.
  */
-function toolQuery(ids: string[], state: { calls: number; pending?: PendingToolRegistry; results: unknown[] }) {
+function toolQuery(
+  ids: string[],
+  state: { calls: number; pending?: PendingToolRegistry; results: unknown[] },
+  thenIds: string[] = [],
+) {
   return (params: { options: Record<string, unknown> }) => {
     state.calls += 1;
     const hooks = params.options.hooks as
       | { PreToolUse?: Array<{ hooks: Array<(input: Record<string, unknown>) => Promise<unknown>> }> }
       | undefined;
-    for (const id of ids) {
-      void hooks?.PreToolUse?.[0]?.hooks[0]?.({
-        hook_event_name: "PreToolUse",
-        tool_name: "mcp__claude_sub_to_api__lookup",
-        tool_use_id: id,
-      });
+    async function* round(roundIds: string[], messageId: string) {
+      for (const id of roundIds) {
+        void hooks?.PreToolUse?.[0]?.hooks[0]?.({
+          hook_event_name: "PreToolUse",
+          tool_name: "mcp__claude_sub_to_api__lookup",
+          tool_use_id: id,
+        });
+      }
+      yield { type: "stream_event", event: { type: "message_start", message: { id: messageId, usage: { input_tokens: 4 } } } };
+      for (const [index, id] of roundIds.entries()) {
+        yield { type: "stream_event", event: { type: "content_block_start", index, content_block: { type: "tool_use", id, name: "mcp__claude_sub_to_api__lookup" } } };
+        yield { type: "stream_event", event: { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: '{"q":"x"}' } } };
+        yield { type: "stream_event", event: { type: "content_block_stop", index } };
+      }
+      yield { type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 2 } } };
+      // Simulate the CLI invoking the MCP handlers after message_stop.
+      const calls: Array<Promise<unknown>> = [];
+      setTimeout(() => {
+        for (const _ of roundIds) {
+          const call = state.pending!.register("lookup", { q: "x" });
+          call.catch(() => {});
+          calls.push(call);
+        }
+      }, 0);
+      yield { type: "stream_event", event: { type: "message_stop" } };
+      state.results.push(...(await Promise.all(calls)));
     }
     return {
       async *[Symbol.asyncIterator]() {
-        yield { type: "stream_event", event: { type: "message_start", message: { id: "msg_10", usage: { input_tokens: 4 } } } };
-        for (const [index, id] of ids.entries()) {
-          yield { type: "stream_event", event: { type: "content_block_start", index, content_block: { type: "tool_use", id, name: "mcp__claude_sub_to_api__lookup" } } };
-          yield { type: "stream_event", event: { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: '{"q":"x"}' } } };
-          yield { type: "stream_event", event: { type: "content_block_stop", index } };
-        }
-        yield { type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 2 } } };
-        // Simulate the CLI invoking the MCP handlers after message_stop.
-        const calls: Array<Promise<unknown>> = [];
-        setTimeout(() => {
-          for (const _ of ids) {
-            const call = state.pending!.register("lookup", { q: "x" });
-            call.catch(() => {});
-            calls.push(call);
-          }
-        }, 0);
-        yield { type: "stream_event", event: { type: "message_stop" } };
-        state.results.push(...(await Promise.all(calls)));
+        yield* round(ids, "msg_10");
+        if (thenIds.length > 0) yield* round(thenIds, "msg_12");
         yield { type: "stream_event", event: { type: "message_start", message: { id: "msg_11", usage: { input_tokens: 6 } } } };
         yield { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } } };
         yield { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "done" } } };
@@ -609,7 +617,7 @@ function toolQuery(ids: string[], state: { calls: number; pending?: PendingToolR
   };
 }
 
-function toolRunner(ids: string[], overrides: Partial<Config> = {}) {
+function toolRunner(ids: string[], overrides: Partial<Config> = {}, thenIds: string[] = []) {
   const state: { calls: number; pending?: PendingToolRegistry; results: unknown[] } = {
     calls: 0,
     results: [],
@@ -617,7 +625,7 @@ function toolRunner(ids: string[], overrides: Partial<Config> = {}) {
   const runner = new ClaudeRunner(
     { ...config, ...overrides },
     createLogger("error"),
-    toolQuery(ids, state) as never,
+    toolQuery(ids, state, thenIds) as never,
     () => (state.pending = new PendingToolRegistry()),
   );
   const first = { role: "user" as const, content: "find x" };
@@ -706,6 +714,41 @@ test("tool results sent the moment the message ends find the parked turn", async
   assert.equal(state.calls, 1);
   assert.equal(second.reused, true);
   assert.deepEqual(second.response.content[0], { type: "text", text: "done" });
+  runner.closeAll();
+});
+
+test("tool results reach a parked turn while their own key waits for its slot", async () => {
+  const { runner, state, run } = toolRunner(["t1"], { maxConcurrency: 1 });
+  await run("r1", undefined);
+
+  // An unrelated request holds its key's lock while it waits for the slot.
+  const queued = run("r2", undefined, { conversationKey: "other" });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(state.calls, 1);
+
+  const second = await run("r3", ["t1"], { conversationKey: "other" });
+  assert.equal(second.reused, true);
+  assert.deepEqual(second.response.content[0], { type: "text", text: "done" });
+  // The finished turn yields its slot to the waiting request.
+  assert.equal((await queued).parked, true);
+  assert.equal(state.calls, 2);
+  runner.closeAll();
+});
+
+test("a turn continued under another key belongs to that key when it parks again", async () => {
+  const { runner, state, run } = toolRunner(["t1"], { maxConcurrency: 1 }, ["t2"]);
+  await run("r1", undefined);
+  const second = await run("r2", ["t1"], { conversationKey: "other" });
+  assert.equal(second.parked, true);
+  const rejected = state.pending!.calls()[0]!.result.then(
+    () => false,
+    () => true,
+  );
+
+  // A new message under the continuing key supersedes the parked turn.
+  await run("r3", undefined, { conversationKey: "other" });
+  assert.equal(await rejected, true);
+  assert.equal(state.calls, 2);
   runner.closeAll();
 });
 
