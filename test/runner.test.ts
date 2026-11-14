@@ -738,7 +738,7 @@ test("tool results reach a parked turn while their own key waits for its slot", 
   runner.closeAll();
 });
 
-test("a turn continued under another key belongs to that key when it parks again", async () => {
+test("a turn continued under another key is superseded once it parks again", async () => {
   const { runner, state, run } = toolRunner(["t1"], { maxConcurrency: 1 }, ["t2"]);
   await run("r1", undefined);
   const second = await run("r2", ["t1"], { conversationKey: "other" });
@@ -748,8 +748,19 @@ test("a turn continued under another key belongs to that key when it parks again
     () => true,
   );
 
-  // A new message under the continuing key supersedes the parked turn.
-  await run("r3", undefined, { conversationKey: "other" });
+  // Supersession follows the tool call, whichever key the turn parked under.
+  await run("r3", undefined, {
+    conversationKey: "other",
+    request: {
+      model: "claude-sonnet-5-5",
+      messages: [
+        { role: "user", content: "find x" },
+        { role: "assistant", content: [{ type: "tool_use", id: "t2", name: "lookup", input: { q: "x" } }] },
+        { role: "user", content: "never mind" },
+      ],
+      tools: [lookupTool],
+    },
+  });
   assert.equal(await rejected, true);
   assert.equal(state.calls, 2);
   runner.closeAll();
