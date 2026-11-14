@@ -22,7 +22,7 @@ Anthropic
 - `POST /v1/messages` turns the Messages API request into one Agent SDK turn. Claude runs with its normal Claude Code harness prompt; the client's system prompt is appended as turn instructions and takes precedence for that request. Built-in tools are disabled, and project settings/skills/MCP servers are not loaded.
 - The model is told plainly that it runs in `claude-sub-to-api` through the Claude Code harness, and that the tools come from the API client. Nothing pretends to be the Anthropic API or hides the harness.
 - Prompts are delivered verbatim: Claude Code does not expand `@path` mentions, run slash commands, or inject its own per-turn context. Auto-compaction, CLAUDE.md discovery, user hooks, tool search, the advisor tool, away summaries, and the non-streaming/refusal fallbacks are disabled, so the response is shaped only by this proxy and the API client.
-- Each conversation is bound to a persisted Claude session. A live conversation keeps one Claude Code process alive between turns; it closes after `SESSION_IDLE_MS` idle and the next message resumes the saved session. Resuming it, together with `excludeDynamicSections`, keeps the harness prompt stable and produced real prompt-cache reads in testing.
+- Each conversation continues in a persisted Claude session, found by matching the request's history against recorded checkpoints. A live conversation keeps one Claude Code process alive between turns; it closes after `SESSION_IDLE_MS` idle and the next message resumes the saved session. Resuming it, together with `excludeDynamicSections`, keeps the harness prompt stable and produced real prompt-cache reads in testing.
 - Conversation history is resumed from the bound Claude session when possible. Appended turns resume the session; a rewind or edit forks it at the last checkpoint whose complete history still matches, so earlier turns keep their transcript and prompt cache. With no matching checkpoint, the transcript is replayed into a fresh session. The final user turn, including images and documents, is passed through natively.
 - Client-defined `tools` are exposed to Claude as an in-process MCP server. When Claude calls one, the server returns a normal `tool_use` block and stops the turn. The client executes the tool and sends a follow-up request containing `tool_result`.
 - `GET /v1/models` asks the signed-in CLI which models the account can use.
@@ -129,13 +129,15 @@ One consequence is that the harness prompt is coding-oriented and the CLI attach
 
 ## Session resume and prompt caching
 
-Every request carries a conversation key: the `x-session-id`, `x-bf-session-id` or `x-claude-session-id` header, the `metadata.user_id.session_id` field, or finally a hash of the first user message. The server persists a binding from that key to the Claude Code session id in `STATE_PATH` (default `<claude config dir>/sub-to-api-sessions.json`).
+The proxy finds the Claude session for a request by content. Each completed turn records a checkpoint in `STATE_PATH` (default `<claude config dir>/sub-to-api-sessions.json`): a fingerprint of the complete history through that turn (assistant replies included) and the transcript UUID of its final assistant message. A request continues from the latest checkpoint that matches a prefix of its `messages`, provided the model, system prompt and working directory are the same. No session header is needed for this, and requests that share a client session id but use another model or system prompt (title generation, subagents) get sessions of their own instead of displacing the main conversation's.
 
-While a conversation is live, the proxy keeps one Claude process and pushes each new turn into its input stream. The process is closed after `SESSION_IDLE_MS` (5 minutes) of idle; the next request starts a new process and resumes the saved session. A request that changes the model, system prompt or tools restarts the process.
+Requests also carry a conversation key: the `x-session-id`, `x-bf-session-id` or `x-claude-session-id` header, the `metadata.user_id.session_id` field, or finally a hash of the first user message, combined with the model and system prompt. It only orders requests: those with the same key run one at a time.
 
-When the next request's user turns extend the bound history, the proxy resumes the same Claude session and sends only the new turn instead of replaying a reconstructed transcript. When the client rewinds, edits, or retries history, the proxy forks the session at the latest checkpoint whose complete history still matches and resumes the fork; earlier turns keep their transcript and prompt cache. A checkpoint records the user-message count, a fingerprint of the complete history through that turn (assistant replies included), and the transcript UUID of the final assistant message. Without a matching checkpoint (for example, the first user turn changed, or an earlier assistant reply was edited), it replays the transcript into a fresh session. Tool-result turns are handled by the parked-tool bridge below.
+While a conversation is live, the proxy keeps one Claude process per session and pushes each new turn into its input stream. The process is closed after `SESSION_IDLE_MS` (5 minutes) of idle; the next request starts a new process and resumes the saved session. A request that changes the tools or `max_tokens` restarts the process on the same session; one that changes the model or system prompt starts a session of its own.
 
-A checkpoint is written only when a turn completes. A turn that parks on a tool call updates the session binding but adds no checkpoint; its continuation records one when it finishes. Checkpoints belong to the session that produced them, so a later fork can start from an older session even after newer turns were forked from it.
+When a request extends the history of a session's last completed turn, the proxy resumes that session and sends only the new turn instead of replaying a reconstructed transcript. When the client rewinds, edits, retries or branches history, the proxy forks the session at the matching checkpoint and resumes the fork; earlier turns keep their transcript and prompt cache. A session is also forked, not resumed, while another request is still running on it. Without a matching checkpoint (for example, the first user turn changed, or an earlier assistant reply was edited), it replays the transcript into a fresh session. Tool-result turns are handled by the parked-tool bridge below.
+
+A checkpoint is written only when a turn completes. A turn that parks on a tool call adds no checkpoint; its continuation records one when it finishes. Checkpoints belong to the session that produced them and stay usable after a fork, so a later request can return to the original branch or fork an older session again. A conversation has no length limit; each session keeps its 100 most recent checkpoints, and the 300 most recently used sessions are kept for 30 days.
 
 This is the same mechanism [opencode-claude](https://github.com/openchamber/opencode-claude) uses. With the stable harness prompt (`excludeDynamicSections: true`) and resume, a live two-turn Haiku test showed real cache reuse:
 
@@ -146,9 +148,8 @@ An earlier build that replaced the harness prompt with a custom prompt reported 
 
 Prompt caching improves when:
 
-- the client sends a stable session header (much better than the first-message hash);
-- the system prompt and model stay the same for the conversation;
 - the client appends to history instead of rewriting it;
+- the system prompt and model stay the same for the conversation;
 - the conversation is not idle long enough for the cache to expire.
 
 When Claude calls a client tool, the proxy does not end the CLI turn. The MCP handler blocks, the `tool_use` response is sent, and the process stays alive. The follow-up request with `tool_result` resolves the handler and continues the same live turn, so the session and cache stay intact. A turn nobody resumes is closed after `PARKED_TURN_TTL_MS` (30 minutes by default).
@@ -168,7 +169,7 @@ All configuration is environment-based.
 | `REQUEST_TIMEOUT_MS` | `900000` | Per-request upper bound. |
 | `DEFAULT_MAX_TOKENS` | `8192` | Output ceiling when `max_tokens` is omitted (the Messages API requires it). |
 | `CLAUDE_CWD` | process cwd | Working directory for the CLI. Use a neutral empty directory for an API-only setup; it keeps repository context out of the prompt. |
-| `STATE_PATH` | `<claude config dir>/sub-to-api-sessions.json` | Persisted conversation → Claude session bindings. |
+| `STATE_PATH` | `<claude config dir>/sub-to-api-sessions.json` | Persisted Claude sessions and their checkpoints. |
 | `PARKED_TURN_TTL_MS` | `1800000` | How long a tool turn waits for `tool_result` before its process is closed (`0` disables). |
 | `SESSION_IDLE_MS` | `300000` | How long an idle conversation keeps its Claude process alive (`0` closes it immediately). |
 | `CLAUDE_CODE_MAX_RETRIES` | `0` | CLI API retries. Keep `0` so one API request maps to one model response; clients own retries. |

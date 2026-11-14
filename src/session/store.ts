@@ -1,70 +1,91 @@
 /**
- * Persisted conversation -> Claude session bindings.
+ * Persisted Claude sessions and their checkpoints.
  *
  * Resuming the same Claude session is what keeps Anthropic's prompt cache
- * warm. Each completed turn also records a checkpoint: the user-message count
- * and the Claude transcript UUID at the end of that turn. When the client
- * rewinds or edits history, the session is forked at the latest matching
- * checkpoint instead of being discarded.
+ * warm. Each completed turn records a checkpoint: a fingerprint of the
+ * complete history through that turn and the Claude transcript UUID at its
+ * end. A request is matched to a session by content: the longest prefix of
+ * its history that equals a checkpoint decides where it continues. When that
+ * checkpoint is the end of its transcript the session is resumed; otherwise
+ * (a rewind, an edit, a branch, a turn still running) it is forked there.
+ *
+ * Nothing here depends on a conversation key, so requests that share a key
+ * but differ in model or system prompt cannot overwrite each other, and two
+ * conversations that happen to share a key still find their own sessions.
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Message } from "../anthropic/types.js";
-import {
-  hasToolResult,
-  historyFingerprint,
-  historyPrefixHashes,
-  userMessageHashes,
-} from "./hashes.js";
+import { hasToolResult, historyFingerprint, historyPrefixHashes } from "./hashes.js";
 import type { Logger } from "../logger.js";
 
 export interface Checkpoint {
-  /** Number of user messages the session had answered at this point. */
-  count: number;
-  /** Hash of the last user message in that turn. */
-  hash: string;
   /** Fingerprint of the complete history through this turn. */
   historyHash: string;
-  /** Claude session containing this checkpoint. */
-  sessionId: string;
   /** Transcript UUID at the end of the turn. */
   leafUuid: string;
 }
 
-interface Binding {
-  sessionId: string;
+/** What a session was launched with; a checkpoint only matches inside it. */
+export interface SessionScope {
   model: string;
   cwd: string;
   systemHash: string;
-  userHashes: string[];
-  checkpoints?: Checkpoint[];
+}
+
+interface SessionEntry extends SessionScope {
+  /**
+   * The checkpoint the transcript currently ends at, by history fingerprint.
+   * Empty while a turn is running or parked on a tool call, because the
+   * transcript then extends past the last checkpoint.
+   */
+  tip: string;
+  checkpoints: Checkpoint[];
   updatedAt: number;
+}
+
+interface StateFile {
+  version: 2;
+  sessions: Record<string, SessionEntry>;
 }
 
 export type ResumeDecision =
   | {
       kind: "resume";
       sessionId: string;
+      /** Index in the request's messages where the new turns start. */
       fromIndex: number;
-      matchedUsers: number;
+      /** Fingerprint of the checkpoint the session is resumed at. */
+      historyHash?: string;
     }
   | {
       kind: "fork";
       sessionId: string;
       upToMessageId: string;
       fromIndex: number;
-      matchedUsers: number;
     }
   | { kind: "fresh" };
 
-const MAX_BINDINGS = 300;
-const MAX_HASHES = 500;
+const MAX_SESSIONS = 300;
 const MAX_CHECKPOINTS = 100;
 const MAX_AGE_MS = 30 * 24 * 60 * 60_000;
 
+function scopeKey(scope: SessionScope): string {
+  return JSON.stringify([scope.model, scope.cwd, scope.systemHash]);
+}
+
+function indexKey(scope: SessionScope, historyHash: string): string {
+  return `${scopeKey(scope)}\u0000${historyHash}`;
+}
+
 export class SessionStore {
-  private data: Record<string, Binding> = {};
-  private dirty = false;
+  private sessions = new Map<string, SessionEntry>();
+  /**
+   * Scope and history fingerprint -> the sessions holding that checkpoint,
+   * most recently recorded last. Several sessions can hold the same history
+   * (a fork and its source, a replay), so dropping one must not hide the rest.
+   */
+  private index = new Map<string, string[]>();
 
   constructor(
     private readonly path: string | undefined,
@@ -76,194 +97,258 @@ export class SessionStore {
   private load(): void {
     if (!this.path || !existsSync(this.path)) return;
     try {
-      const parsed = JSON.parse(readFileSync(this.path, "utf8")) as Record<string, Binding>;
-      if (parsed && typeof parsed === "object") this.data = parsed;
+      const parsed = JSON.parse(readFileSync(this.path, "utf8")) as unknown;
+      if (!parsed || typeof parsed !== "object") return;
+      const sessions =
+        (parsed as StateFile).version === 2
+          ? Object.entries((parsed as StateFile).sessions ?? {})
+          : migrateBindings(parsed as Record<string, LegacyBinding>);
+      // Oldest first, so the newest session wins a shared checkpoint.
+      sessions.sort(([, a], [, b]) => a.updatedAt - b.updatedAt);
+      for (const [sessionId, entry] of sessions) {
+        if (!validEntry(entry)) continue;
+        this.sessions.set(sessionId, entry);
+        for (const checkpoint of entry.checkpoints) this.addToIndex(sessionId, entry, checkpoint);
+      }
     } catch {
-      this.logger.warn("could not read session bindings", { path: this.path });
+      this.logger.warn("could not read session state", { path: this.path });
     }
   }
 
   private save(): void {
-    if (!this.path || !this.dirty) return;
+    if (!this.path) return;
     try {
       mkdirSync(dirname(this.path), { recursive: true });
       const tmp = `${this.path}.tmp`;
-      writeFileSync(tmp, `${JSON.stringify(this.data, null, 2)}\n`, "utf8");
+      const file: StateFile = { version: 2, sessions: Object.fromEntries(this.sessions) };
+      writeFileSync(tmp, `${JSON.stringify(file)}\n`, "utf8");
       renameSync(tmp, this.path);
-      this.dirty = false;
     } catch (error) {
-      this.logger.warn("could not write session bindings", {
+      this.logger.warn("could not write session state", {
         path: this.path,
         error: String(error),
       });
     }
   }
 
-  plan(input: {
-    key: string;
-    messages: Message[];
-    model: string;
-    cwd: string;
-    systemHash: string;
-    now?: number;
-  }): ResumeDecision {
-    const binding = this.data[input.key];
-    if (!binding) return { kind: "fresh" };
-    if (input.now !== undefined && input.now - binding.updatedAt > MAX_AGE_MS) {
-      delete this.data[input.key];
-      this.dirty = true;
-      return { kind: "fresh" };
-    }
-    if (
-      binding.model !== input.model ||
-      binding.cwd !== input.cwd ||
-      binding.systemHash !== input.systemHash
-    ) {
-      return { kind: "fresh" };
-    }
-
+  /**
+   * Decide how a request continues. The latest checkpoint matching a prefix
+   * of its history wins; everything after it is sent as new turns.
+   */
+  plan(input: SessionScope & { messages: Message[]; now?: number }): ResumeDecision {
     const userIndices: number[] = [];
     for (let index = 0; index < input.messages.length; index += 1) {
       if (input.messages[index]?.role === "user") userIndices.push(index);
     }
-    if (userIndices.length === 0) return { kind: "fresh" };
+    if (userIndices.length < 2) return { kind: "fresh" };
 
     // One rolling pass gives the history fingerprint at every message index.
     const prefixHashes = historyPrefixHashes(input.messages);
 
-    // A checkpoint is usable only when the client's complete history through
-    // that turn, assistant replies included, still matches the history the
-    // checkpoint recorded. User-only matching would miss an edited reply and
-    // resume a transcript the client no longer has.
-    const matching = (binding.checkpoints ?? [])
-      .filter((checkpoint) => {
-        if (checkpoint.count <= 0 || checkpoint.count >= userIndices.length) return false;
-        if (!checkpoint.leafUuid || !checkpoint.sessionId) return false;
-        if (typeof checkpoint.historyHash !== "string" || !checkpoint.historyHash) {
-          // Legacy checkpoint without a full-history fingerprint.
-          return false;
-        }
-        const boundary = userIndices[checkpoint.count]!;
-        return prefixHashes[boundary - 1] === checkpoint.historyHash;
-      })
-      .sort((a, b) => b.count - a.count);
-
-    const latest = matching[0];
-
-    // The normal case: the client appended a turn after the last completed
-    // one, and that turn's history still matches exactly.
-    if (
-      latest &&
-      latest.count === binding.userHashes.length &&
-      latest.sessionId === binding.sessionId &&
-      userIndices.length > latest.count
-    ) {
-      const fromIndex = userIndices[latest.count]!;
-      if (!input.messages.slice(fromIndex).some(hasToolResult)) {
-        return {
-          kind: "resume",
-          sessionId: binding.sessionId,
-          fromIndex,
-          matchedUsers: latest.count,
-        };
+    // A checkpoint ends a turn, so it can only sit right before a user
+    // message. The complete history through it must match, assistant replies
+    // included: user-only matching would miss an edited reply and resume a
+    // transcript the client no longer has.
+    for (let count = userIndices.length - 1; count >= 1; count -= 1) {
+      const fromIndex = userIndices[count]!;
+      const historyHash = prefixHashes[fromIndex - 1]!;
+      const sessionId = this.index.get(indexKey(input, historyHash))?.at(-1);
+      if (!sessionId) continue;
+      const session = this.sessions.get(sessionId);
+      const checkpoint = session?.checkpoints.find((item) => item.historyHash === historyHash);
+      if (!session || !checkpoint) continue;
+      if (input.now !== undefined && input.now - session.updatedAt > MAX_AGE_MS) {
+        this.forget(sessionId);
+        continue;
       }
-    }
 
-    // A rewrite, rewind or retry: fork at the latest checkpoint whose complete
-    // history still matches, then send the remaining turns.
-    if (latest) {
-      return {
-        kind: "fork",
-        sessionId: latest.sessionId,
-        upToMessageId: latest.leafUuid,
-        fromIndex: userIndices[latest.count]!,
-        matchedUsers: latest.count,
-      };
+      // The normal case: the client appended a turn after the last completed
+      // one, and nothing else has continued that transcript since.
+      if (
+        session.tip === historyHash &&
+        !input.messages.slice(fromIndex).some(hasToolResult)
+      ) {
+        return { kind: "resume", sessionId, fromIndex, historyHash };
+      }
+      // A rewrite, rewind, retry or branch: fork at the checkpoint, then send
+      // the remaining turns.
+      return { kind: "fork", sessionId, upToMessageId: checkpoint.leafUuid, fromIndex };
     }
 
     return { kind: "fresh" };
   }
 
-  record(input: {
-    key: string;
-    sessionId: string;
-    model: string;
-    cwd: string;
-    systemHash: string;
-    /** Complete history through this turn, including the assistant reply. */
-    history: Message[];
-    /** Transcript UUID of the final assistant message of this turn. */
-    leafUuid?: string;
-    /** A tool turn is not a completed checkpoint yet. */
-    parked?: boolean;
-    /** Decision that started this turn, for checkpoint retention. */
-    decision?: ResumeDecision | null;
-  }): void {
-    const userHashes = userMessageHashes(input.history);
-    if (userHashes.length > MAX_HASHES) return;
-    const existing = this.data[input.key];
-    const decision = input.decision;
-    let checkpoints: Checkpoint[];
-    if (decision?.kind === "fresh") {
-      checkpoints = [];
-    } else if (decision?.kind === "fork") {
-      checkpoints = (existing?.checkpoints ?? []).filter(
-        (checkpoint) => checkpoint.count <= decision.matchedUsers,
-      );
-    } else {
-      checkpoints =
-        existing &&
-        existing.sessionId === input.sessionId &&
-        existing.model === input.model &&
-        existing.cwd === input.cwd &&
-        existing.systemHash === input.systemHash &&
-        existing.userHashes.length <= userHashes.length &&
-        existing.userHashes.every((hash, index) => hash === userHashes[index])
-          ? [...(existing.checkpoints ?? [])]
-          : [];
+  /**
+   * Take the session a decision is about to use. A resumed session stops
+   * being resumable until its turn is recorded, so two requests can never
+   * append to one transcript at the same time.
+   */
+  claim(decision: ResumeDecision): void {
+    if (decision.kind === "fresh") return;
+    const session = this.sessions.get(decision.sessionId);
+    if (!session) return;
+    session.updatedAt = Date.now();
+    if (decision.kind === "resume") {
+      session.tip = "";
+      // On disk before the turn reaches the CLI: after a crash mid-turn the
+      // transcript must not look like it still ends at this checkpoint.
+      this.save();
+    }
+  }
+
+  /** Undo a claim whose turn never reached the session. */
+  release(decision: ResumeDecision): void {
+    if (decision.kind !== "resume" || !decision.historyHash) return;
+    const session = this.sessions.get(decision.sessionId);
+    if (!session || session.tip !== "") return;
+    if (session.checkpoints.some((item) => item.historyHash === decision.historyHash)) {
+      session.tip = decision.historyHash;
+      this.save();
+    }
+  }
+
+  record(
+    input: SessionScope & {
+      sessionId: string;
+      /** Complete history through this turn, including the assistant reply. */
+      history: Message[];
+      /** Transcript UUID of the final assistant message of this turn. */
+      leafUuid?: string;
+      /** A tool turn is not a completed checkpoint yet. */
+      parked?: boolean;
+    },
+  ): void {
+    let session = this.sessions.get(input.sessionId);
+    if (session && scopeKey(session) !== scopeKey(input)) {
+      this.forget(input.sessionId, false);
+      session = undefined;
+    }
+    if (!session) {
+      session = {
+        model: input.model,
+        cwd: input.cwd,
+        systemHash: input.systemHash,
+        tip: "",
+        checkpoints: [],
+        updatedAt: 0,
+      };
+      this.sessions.set(input.sessionId, session);
     }
 
-    if (!input.parked && input.leafUuid && userHashes.length > 0) {
+    session.tip = "";
+    if (!input.parked && input.leafUuid && input.history.some((m) => m.role === "user")) {
       const checkpoint: Checkpoint = {
-        count: userHashes.length,
-        hash: userHashes[userHashes.length - 1]!,
         historyHash: historyFingerprint(input.history),
-        sessionId: input.sessionId,
         leafUuid: input.leafUuid,
       };
-      checkpoints = checkpoints.filter((item) => item.count !== checkpoint.count);
-      checkpoints.push(checkpoint);
-      checkpoints.sort((a, b) => a.count - b.count);
-      if (checkpoints.length > MAX_CHECKPOINTS) {
-        checkpoints = checkpoints.slice(-MAX_CHECKPOINTS);
+      session.checkpoints = session.checkpoints.filter(
+        (item) => item.historyHash !== checkpoint.historyHash,
+      );
+      session.checkpoints.push(checkpoint);
+      while (session.checkpoints.length > MAX_CHECKPOINTS) {
+        this.unindex(input.sessionId, session, session.checkpoints.shift()!);
       }
+      this.addToIndex(input.sessionId, session, checkpoint);
+      session.tip = checkpoint.historyHash;
     }
+    session.updatedAt = Date.now();
 
-    this.data[input.key] = {
-      sessionId: input.sessionId,
-      model: input.model,
-      cwd: input.cwd,
-      systemHash: input.systemHash,
-      userHashes,
-      ...(checkpoints.length > 0 ? { checkpoints } : {}),
-      updatedAt: Date.now(),
-    };
     this.prune();
-    this.dirty = true;
     this.save();
   }
 
-  clear(key: string): void {
-    if (!this.data[key]) return;
-    delete this.data[key];
-    this.dirty = true;
-    this.save();
+  /** Drop a session whose transcript is gone. */
+  forget(sessionId: string, save = true): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    for (const checkpoint of session.checkpoints) this.unindex(sessionId, session, checkpoint);
+    this.sessions.delete(sessionId);
+    if (save) this.save();
+  }
+
+  private addToIndex(sessionId: string, session: SessionEntry, checkpoint: Checkpoint): void {
+    const key = indexKey(session, checkpoint.historyHash);
+    const owners = (this.index.get(key) ?? []).filter((id) => id !== sessionId);
+    owners.push(sessionId);
+    this.index.set(key, owners);
+  }
+
+  private unindex(sessionId: string, session: SessionEntry, checkpoint: Checkpoint): void {
+    const key = indexKey(session, checkpoint.historyHash);
+    const owners = (this.index.get(key) ?? []).filter((id) => id !== sessionId);
+    if (owners.length > 0) this.index.set(key, owners);
+    else this.index.delete(key);
   }
 
   private prune(): void {
-    const entries = Object.entries(this.data);
-    if (entries.length <= MAX_BINDINGS) return;
-    entries.sort(([, a], [, b]) => b.updatedAt - a.updatedAt);
-    this.data = Object.fromEntries(entries.slice(0, MAX_BINDINGS));
+    if (this.sessions.size <= MAX_SESSIONS) return;
+    const oldest = [...this.sessions.entries()]
+      .sort(([, a], [, b]) => a.updatedAt - b.updatedAt)
+      .slice(0, this.sessions.size - MAX_SESSIONS);
+    for (const [sessionId] of oldest) this.forget(sessionId, false);
   }
+}
+
+function validEntry(entry: SessionEntry): boolean {
+  return (
+    Boolean(entry) &&
+    typeof entry.model === "string" &&
+    typeof entry.cwd === "string" &&
+    typeof entry.systemHash === "string" &&
+    typeof entry.tip === "string" &&
+    typeof entry.updatedAt === "number" &&
+    Array.isArray(entry.checkpoints) &&
+    entry.checkpoints.every(
+      (item) => typeof item?.historyHash === "string" && typeof item.leafUuid === "string",
+    )
+  );
+}
+
+/** The state file before version 2: one binding per conversation key. */
+interface LegacyBinding extends SessionScope {
+  sessionId: string;
+  userHashes?: string[];
+  checkpoints?: Array<{
+    count?: number;
+    historyHash?: string;
+    sessionId?: string;
+    leafUuid?: string;
+  }>;
+  updatedAt: number;
+}
+
+function migrateBindings(bindings: Record<string, LegacyBinding>): Array<[string, SessionEntry]> {
+  const sessions = new Map<string, SessionEntry>();
+  for (const binding of Object.values(bindings)) {
+    if (!binding || typeof binding !== "object" || !Array.isArray(binding.checkpoints)) continue;
+    for (const checkpoint of binding.checkpoints) {
+      // Checkpoints without a full-history fingerprint cannot be matched.
+      if (!checkpoint?.historyHash || !checkpoint.leafUuid || !checkpoint.sessionId) continue;
+      let session = sessions.get(checkpoint.sessionId);
+      if (!session) {
+        session = {
+          model: binding.model,
+          cwd: binding.cwd,
+          systemHash: binding.systemHash,
+          tip: "",
+          checkpoints: [],
+          updatedAt: Number(binding.updatedAt) || 0,
+        };
+        sessions.set(checkpoint.sessionId, session);
+      }
+      session.checkpoints.push({
+        historyHash: checkpoint.historyHash,
+        leafUuid: checkpoint.leafUuid,
+      });
+      // The binding's own session ends at its last checkpoint unless a tool
+      // turn had moved past it.
+      if (
+        checkpoint.sessionId === binding.sessionId &&
+        checkpoint.count === binding.userHashes?.length
+      ) {
+        session.tip = checkpoint.historyHash;
+      }
+    }
+  }
+  return [...sessions.entries()];
 }

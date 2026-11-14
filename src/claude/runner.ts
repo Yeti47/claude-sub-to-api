@@ -57,8 +57,17 @@ function isMissingSession(error: unknown): boolean {
   );
 }
 
+/** Whether a failed fork means the source transcript or checkpoint is gone. */
+function isMissingTranscript(error: unknown): boolean {
+  if ((error as { code?: unknown } | null)?.code === "ENOENT") return true;
+  return /not found|no messages to fork|ENOENT/i.test(errorMessage(error));
+}
+
 export interface RunInput {
-  /** Stable conversation identity; one live process per key. */
+  /**
+   * Conversation identity. Requests with the same key run one at a time; the
+   * session a request continues is found by its history, not by this key.
+   */
   conversationKey: string;
   request: MessagesRequest;
   signal: AbortSignal;
@@ -71,8 +80,15 @@ export interface RunInput {
   resumeFromIndex?: number;
   /** Persist the CLI transcript so a later request can resume it. */
   persistSession?: boolean;
-  /** Recompute the resume/fork decision inside the conversation lock. */
+  /**
+   * Compute the resume/fork decision inside the conversation lock, and claim
+   * the session it names.
+   */
   plan?: () => ResumeDecision;
+  /** Give back a claimed session whose turn failed. */
+  release?: (decision: ResumeDecision) => void;
+  /** Drop a session whose transcript turned out to be missing. */
+  forget?: (sessionId: string) => void;
   /**
    * Persist the session binding before the conversation lock is released.
    * `decision` is the plan that started the turn, or undefined for a parked
@@ -264,7 +280,7 @@ export class ClaudeRunner {
     return env;
   }
 
-  private readonly processes = new Map<string, TurnState>();
+  private readonly processes = new Set<TurnState>();
   private readonly locks = new KeyedLock();
 
   async run(input: RunInput): Promise<RunResult> {
@@ -285,23 +301,39 @@ export class ClaudeRunner {
     if (input.signal.aborted) throw new ClientAbort();
     // Planning happens under the conversation lock, so a concurrent request
     // cannot reuse a plan computed against an older committed history.
-    let decision: ResumeDecision = input.plan
+    const decision: ResumeDecision = input.plan
       ? input.plan()
       : input.resumeSessionId !== undefined && input.resumeFromIndex !== undefined
         ? {
             kind: "resume",
             sessionId: input.resumeSessionId,
             fromIndex: input.resumeFromIndex,
-            matchedUsers: 0,
           }
         : { kind: "fresh" };
 
-    let state = this.processes.get(input.conversationKey);
-    // A fork reads a transcript that this conversation's live process owns.
-    // Close it first so the CLI is not still appending to the file.
-    if (decision.kind === "fork" && state) {
-      this.closeState(state, "Forking the conversation history");
-      state = undefined;
+    try {
+      return await this.runDecided(input, decision);
+    } catch (error) {
+      input.release?.(decision);
+      throw error;
+    }
+  }
+
+  private async runDecided(input: RunInput, planned: ResumeDecision): Promise<RunResult> {
+    let decision = planned;
+    // This conversation moved to a fork, so its idle process on the source
+    // session is superseded. Closing it also keeps the CLI from appending to
+    // the transcript while it is copied.
+    if (decision.kind === "fork") {
+      for (const live of [...this.processes]) {
+        if (
+          live.key === input.conversationKey &&
+          live.sessionId === decision.sessionId &&
+          !live.busy
+        ) {
+          this.closeState(live, "Forking the conversation history");
+        }
+      }
     }
 
     let resumeSessionId: string | undefined;
@@ -311,12 +343,14 @@ export class ClaudeRunner {
       resumeSessionId = decision.sessionId;
       resumeFromIndex = decision.fromIndex;
     } else if (decision.kind === "fork") {
-      const forkedId = await this.fork(decision);
-      if (forkedId) {
-        resumeSessionId = forkedId;
+      const fork = await this.fork(decision);
+      if (fork.sessionId) {
+        resumeSessionId = fork.sessionId;
         resumeFromIndex = decision.fromIndex;
         forked = true;
       } else {
+        // Any other failure (a full disk, say) leaves the source usable.
+        if (fork.missing) input.forget?.(decision.sessionId);
         decision = { kind: "fresh" };
       }
     }
@@ -324,25 +358,24 @@ export class ClaudeRunner {
     let prepared = prepareTurn(input.request, { resumeFromIndex });
     let launchKey = this.launchKey(input.request, prepared);
 
-    if (state) {
-      const sameSession =
-        !resumeSessionId || !state.sessionId || state.sessionId === resumeSessionId;
-      const compatible =
-        !state.closed &&
-        !state.busy &&
-        state.launchKey === launchKey &&
-        resumeFromIndex !== undefined &&
-        sameSession;
-      if (!compatible) {
-        this.closeState(state, "Session configuration or history changed");
-        state = undefined;
-      }
+    // The live process that owns the resumed session, if there is one. A
+    // claimed session has no running turn, so a process that cannot take this
+    // turn (different model, system prompt or tools) is closed, not shared.
+    let state = resumeSessionId
+      ? [...this.processes].find((live) => live.sessionId === resumeSessionId)
+      : undefined;
+    if (state && (state.closed || state.busy || state.launchKey !== launchKey)) {
+      this.closeState(state, "Session configuration changed");
+      state = undefined;
     }
 
     try {
       if (state) {
         this.cancelIdle(state);
         if (input.signal.aborted) throw new ClientAbort();
+        // The process now serves this conversation: a tool turn it parks is
+        // continued under this conversation's lock, not its previous one's.
+        state.key = input.conversationKey;
         state.busy = true;
         state.lastUsed = Date.now();
         state.pending.beginPhase();
@@ -367,6 +400,7 @@ export class ClaudeRunner {
           requestId: input.requestId,
           sessionId: resumeSessionId,
         });
+        if (resumeSessionId) input.forget?.(resumeSessionId);
         const fresh = {
           ...input,
           resumeSessionId: undefined,
@@ -389,7 +423,7 @@ export class ClaudeRunner {
    */
   private async fork(
     decision: Extract<ResumeDecision, { kind: "fork" }>,
-  ): Promise<string | undefined> {
+  ): Promise<{ sessionId?: string; missing?: boolean }> {
     try {
       const result = await this.forkFn(decision.sessionId, {
         upToMessageId: decision.upToMessageId,
@@ -400,14 +434,14 @@ export class ClaudeRunner {
         forkedSessionId: result.sessionId,
         upToMessageId: decision.upToMessageId,
       });
-      return result.sessionId;
+      return { sessionId: result.sessionId };
     } catch (error) {
       this.logger.warn("could not fork Claude session; replaying history", {
         sessionId: decision.sessionId,
         upToMessageId: decision.upToMessageId,
         error: errorMessage(error),
       });
-      return undefined;
+      return { missing: isMissingTranscript(error) };
     }
   }
 
@@ -451,7 +485,7 @@ export class ClaudeRunner {
         lastUsed: Date.now(),
         closed: false,
       };
-      this.processes.set(input.conversationKey, state);
+      this.processes.add(state);
       inputQueue.push({ ...prepared.prompt, uuid: randomUUID() } as SDKUserMessage);
       return await this.consume(state, input);
     } catch (error) {
@@ -558,7 +592,7 @@ export class ClaudeRunner {
 
   private async acquireSlot(signal: AbortSignal): Promise<() => void> {
     if (this.processes.size >= this.config.maxConcurrency) {
-      const idle = [...this.processes.values()]
+      const idle = [...this.processes]
         .filter((state) => !state.busy && !state.closed)
         .sort((a, b) => a.lastUsed - b.lastUsed)[0];
       if (idle) this.closeState(idle, "Evicted idle session");
@@ -591,7 +625,7 @@ export class ClaudeRunner {
   }
 
   closeAll(reason = "Server shutting down"): void {
-    for (const state of [...this.processes.values()]) this.closeState(state, reason);
+    for (const state of [...this.processes]) this.closeState(state, reason);
   }
 
   private async consume(state: TurnState, input: RunInput): Promise<RunResult> {
@@ -777,7 +811,7 @@ export class ClaudeRunner {
     } catch {
       // already closed
     }
-    if (this.processes.get(state.key) === state) this.processes.delete(state.key);
+    this.processes.delete(state);
     state.release();
   }
 }
