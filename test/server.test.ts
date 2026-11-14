@@ -22,6 +22,8 @@ const config: Config = {
   defaultMaxTokens: 100,
   parkedTurnTtlMs: 0,
   sessionIdleMs: 0,
+  parkedEvictableAfterMs: 0,
+  queueTimeoutMs: 0,
 };
 
 const response: MessagesResponse = {

@@ -32,6 +32,13 @@ export interface Config {
   parkedTurnTtlMs: number;
   /** How long an idle conversation keeps its Claude process alive. */
   sessionIdleMs: number;
+  /**
+   * How long a parked tool turn is safe from eviction. After that, a request
+   * that needs a process and finds none free may close it. 0 never evicts.
+   */
+  parkedEvictableAfterMs: number;
+  /** How long a request waits for a free process before it gets a 529. 0 waits without limit. */
+  queueTimeoutMs: number;
 }
 
 const LEVELS: LogLevel[] = ["debug", "info", "warn", "error"];
@@ -81,5 +88,7 @@ export function loadConfig(envVars: NodeJS.ProcessEnv = process.env): Config {
     statePath: envVars.STATE_PATH?.trim() || undefined,
     parkedTurnTtlMs: intEnv("PARKED_TURN_TTL_MS", 30 * 60_000, 0, 24 * 60 * 60_000),
     sessionIdleMs: intEnv("SESSION_IDLE_MS", 5 * 60_000, 0, 24 * 60 * 60_000),
+    parkedEvictableAfterMs: intEnv("PARKED_EVICTABLE_AFTER_MS", 60_000, 0, 24 * 60 * 60_000),
+    queueTimeoutMs: intEnv("QUEUE_TIMEOUT_MS", 30_000, 0, 3_600_000),
   };
 }

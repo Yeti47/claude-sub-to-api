@@ -120,6 +120,14 @@ interface Delivery {
   sent: boolean;
 }
 
+/** A process slot acquired outside the conversation lock, until a launch takes it. */
+interface Slot {
+  release?: () => void;
+}
+
+/** No process slot is free; the request waits for one and plans again. */
+class NeedsSlot extends Error {}
+
 /** How a new process is launched. */
 interface Launch {
   prepared: PreparedTurn;
@@ -143,21 +151,35 @@ export class ClaudeRunner {
   }
 
   async run(input: RunInput): Promise<RunResult> {
-    while (true) {
-      const key = this.lockKey(input);
-      let release: (() => void) | undefined;
-      try {
-        release = await this.locks.acquire(key, input.signal);
-      } catch {
-        throw new ClientAbort();
+    const slot: Slot = {};
+    let budget = this.config.queueTimeoutMs;
+    try {
+      while (true) {
+        const key = this.lockKey(input);
+        let release: (() => void) | undefined;
+        try {
+          release = await this.locks.acquire(key, input.signal);
+        } catch {
+          throw new ClientAbort();
+        }
+        try {
+          // The parked turn may have been answered or closed while waiting.
+          if (this.lockKey(input) !== key) continue;
+          return await this.runLocked(input, slot);
+        } catch (error) {
+          if (!(error instanceof NeedsSlot)) throw error;
+        } finally {
+          release();
+        }
+        // Capacity is awaited without the conversation lock, so tool results
+        // for a turn parked under this key still reach it. The request then
+        // plans again: the history may have moved on in the meantime.
+        const started = Date.now();
+        slot.release = await this.acquireSlot(input.signal, budget);
+        if (budget > 0) budget = Math.max(1, budget - (Date.now() - started));
       }
-      try {
-        // The parked turn may have been answered or closed while waiting.
-        if (this.lockKey(input) !== key) continue;
-        return await this.runLocked(input);
-      } finally {
-        release();
-      }
+    } finally {
+      slot.release?.();
     }
   }
 
@@ -176,16 +198,22 @@ export class ClaudeRunner {
     for (const process of [...this.processes]) process.close(reason);
   }
 
-  private async runLocked(input: RunInput): Promise<RunResult> {
+  private async runLocked(input: RunInput, slot: Slot): Promise<RunResult> {
     if (input.signal.aborted) throw new ClientAbort();
 
     const toolResults = lastToolResults(input.request.messages);
     const parked = this.findParked([...toolResults.results.keys()]);
     if (parked) return this.continueParked(parked, input, toolResults);
 
-    // The conversation moved on without answering its tool calls.
+    // The client moved past a tool call without answering it in its final
+    // message, so the turn waiting for that answer is dead. Other parked
+    // turns stay: agents running in parallel may share a conversation key.
+    const called = toolUseIds(input.request.messages);
     for (const process of [...this.processes]) {
-      if (process.key === input.conversationKey && process.status === "parked") {
+      if (
+        process.status === "parked" &&
+        process.pending.pendingIds().some((id) => called.has(id))
+      ) {
         process.close("Superseded by a new request");
       }
     }
@@ -204,7 +232,7 @@ export class ClaudeRunner {
 
     const delivery: Delivery = { sent: false };
     try {
-      return await this.runDecided(input, decision, delivery);
+      return await this.runDecided(input, decision, delivery, slot);
     } catch (error) {
       if (!delivery.sent) input.release?.(decision);
       throw error;
@@ -259,6 +287,7 @@ export class ClaudeRunner {
     input: RunInput,
     planned: ResumeDecision,
     delivery: Delivery,
+    slot: Slot,
   ): Promise<RunResult> {
     let decision = planned;
     // This conversation moved to a fork, so its idle process on the source
@@ -274,6 +303,8 @@ export class ClaudeRunner {
           live.close("Forking the conversation history");
         }
       }
+      // A fork always starts a process; do not copy a transcript to wait.
+      this.reserve(slot);
     }
 
     let resumeSessionId: string | undefined;
@@ -326,7 +357,7 @@ export class ClaudeRunner {
         input.record?.(result, decision);
         return result;
       }
-      const result = await this.startProcess(input, launch, delivery);
+      const result = await this.startProcess(input, launch, delivery, slot);
       if (resumeSessionId !== undefined) result.resumed = true;
       if (forked) result.forked = true;
       input.record?.(result, decision);
@@ -343,6 +374,7 @@ export class ClaudeRunner {
         input,
         { prepared: replay, launchKey: launchKey(this.config, input.request, replay) },
         delivery,
+        slot,
       );
       input.record?.(result, { kind: "fresh" });
       return result;
@@ -382,12 +414,12 @@ export class ClaudeRunner {
     input: RunInput,
     launch: Launch,
     delivery: Delivery,
+    slot: Slot,
   ): Promise<RunResult> {
-    const release = await this.acquireSlot(input.signal);
-    if (input.signal.aborted) {
-      release();
-      throw new ClientAbort();
-    }
+    if (input.signal.aborted) throw new ClientAbort();
+    this.reserve(slot);
+    const release = slot.release!;
+    slot.release = undefined;
     let process: LiveProcess | undefined;
     try {
       const { request, requestId } = input;
@@ -435,18 +467,95 @@ export class ClaudeRunner {
     return this.consume(process, input, launch.resumeSessionId !== undefined);
   }
 
-  private async acquireSlot(signal: AbortSignal): Promise<() => void> {
-    if (this.processes.size >= this.config.maxConcurrency) {
-      const idle = [...this.processes]
-        .filter((process) => process.status === "idle")
-        .sort((a, b) => a.lastUsed - b.lastUsed)[0];
-      if (idle) idle.close("Evicted idle session");
-    }
+  /** Take a free process slot, or have the request wait for one unlocked. */
+  private reserve(slot: Slot): void {
+    slot.release ??= this.limit.tryAcquire();
+    if (!slot.release) throw new NeedsSlot();
+  }
+
+  /**
+   * Wait for a process slot. While every slot is taken, processes nobody is
+   * actively using are closed to make room; a request that still has no slot
+   * after `timeoutMs` is turned away so the client can back off.
+   */
+  private async acquireSlot(signal: AbortSignal, timeoutMs: number): Promise<() => void> {
+    if (signal.aborted) throw new ClientAbort();
+    const wait = new AbortController();
+    const onAbort = () => wait.abort();
+    signal.addEventListener("abort", onAbort, { once: true });
+    let timedOut = false;
+    const timeout =
+      timeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true;
+            wait.abort();
+          }, timeoutMs)
+        : undefined;
+    timeout?.unref?.();
+    // A parked turn becomes evictable as it ages, so keep looking.
+    let recheck: ReturnType<typeof setTimeout> | undefined;
+    const makeRoom = () => {
+      recheck = setTimeout(makeRoom, this.evict() ? 50 : this.nextEvictionMs());
+      recheck.unref?.();
+    };
     try {
-      return await this.limit.acquire(signal);
+      const permit = this.limit.acquire(wait.signal);
+      // Queued behind a permit, whether or not its process exists yet.
+      if (this.limit.waiting > 0) makeRoom();
+      return await permit;
     } catch {
-      throw new ClientAbort();
+      if (!timedOut || signal.aborted) throw new ClientAbort();
+      throw new ApiError(
+        529,
+        "overloaded_error",
+        `All ${this.config.maxConcurrency} Claude processes are busy. Retry shortly.`,
+        QUEUE_RETRY_AFTER_SECONDS,
+      );
+    } finally {
+      clearTimeout(timeout);
+      clearTimeout(recheck);
+      signal.removeEventListener("abort", onAbort);
     }
+  }
+
+  /**
+   * Close the process that costs least to lose: the least recently used idle
+   * one (its session resumes later), else the parked turn that has waited
+   * longest past its grace period (its tool results are replayed into a fork).
+   */
+  private evict(): boolean {
+    const oldest = (status: LiveProcess["status"]) =>
+      [...this.processes]
+        .filter((process) => process.status === status)
+        .sort((a, b) => a.lastUsed - b.lastUsed)[0];
+    const idle = oldest("idle");
+    if (idle) {
+      idle.close("Evicted idle session");
+      return true;
+    }
+    const grace = this.config.parkedEvictableAfterMs;
+    const parked = oldest("parked");
+    if (grace > 0 && parked && Date.now() - parked.lastUsed >= grace) {
+      this.logger.info("evicted a parked tool turn to free a process slot", {
+        sessionId: parked.sessionId,
+        parkedMs: Date.now() - parked.lastUsed,
+      });
+      parked.close("Evicted parked tool turn");
+      return true;
+    }
+    return false;
+  }
+
+  /** When to look for an evictable process again. */
+  private nextEvictionMs(): number {
+    const grace = this.config.parkedEvictableAfterMs;
+    if (grace <= 0) return 1000;
+    const now = Date.now();
+    const waits = [...this.processes]
+      .filter((process) => process.status === "parked")
+      .map((process) => process.lastUsed + grace - now);
+    // A turn that parks from now on is not evictable before its grace period.
+    return Math.min(1000, Math.max(10, waits.length ? Math.min(...waits) : grace));
   }
 
   /**
@@ -577,6 +686,21 @@ export class ClaudeRunner {
       leafUuid: assembler.leafUuid,
     };
   }
+}
+
+/** Seconds a client turned away for lack of a free process should wait. */
+const QUEUE_RETRY_AFTER_SECONDS = 10;
+
+/** Every tool call the request's history contains. */
+function toolUseIds(messages: MessagesRequest["messages"]): Set<string> {
+  const ids = new Set<string>();
+  for (const message of messages ?? []) {
+    if (message.role !== "assistant") continue;
+    for (const block of contentBlocks(message.content)) {
+      if (block.type === "tool_use") ids.add(block.id);
+    }
+  }
+  return ids;
 }
 
 function matchToolCalls(

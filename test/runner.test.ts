@@ -19,6 +19,8 @@ const config: Config = {
   defaultMaxTokens: 100,
   parkedTurnTtlMs: 0,
   sessionIdleMs: 0,
+  parkedEvictableAfterMs: 0,
+  queueTimeoutMs: 0,
 };
 
 function fakeQuery(messages: unknown[], capture?: (options: Record<string, unknown>) => void) {
@@ -736,7 +738,7 @@ test("tool results reach a parked turn while their own key waits for its slot", 
   runner.closeAll();
 });
 
-test("a turn continued under another key belongs to that key when it parks again", async () => {
+test("a turn continued under another key is superseded once it parks again", async () => {
   const { runner, state, run } = toolRunner(["t1"], { maxConcurrency: 1 }, ["t2"]);
   await run("r1", undefined);
   const second = await run("r2", ["t1"], { conversationKey: "other" });
@@ -746,8 +748,19 @@ test("a turn continued under another key belongs to that key when it parks again
     () => true,
   );
 
-  // A new message under the continuing key supersedes the parked turn.
-  await run("r3", undefined, { conversationKey: "other" });
+  // Supersession follows the tool call, whichever key the turn parked under.
+  await run("r3", undefined, {
+    conversationKey: "other",
+    request: {
+      model: "claude-sonnet-5-5",
+      messages: [
+        { role: "user", content: "find x" },
+        { role: "assistant", content: [{ type: "tool_use", id: "t2", name: "lookup", input: { q: "x" } }] },
+        { role: "user", content: "never mind" },
+      ],
+      tools: [lookupTool],
+    },
+  });
   assert.equal(await rejected, true);
   assert.equal(state.calls, 2);
   runner.closeAll();
@@ -781,17 +794,163 @@ test("a parked turn is closed when its results do not arrive in time", async () 
   runner.closeAll();
 });
 
-test("a new message closes the conversation's unanswered parked turn", async () => {
+test("a request that moved past a tool call closes the turn parked on it", async () => {
   const { runner, state, run } = toolRunner(["t1"]);
   await run("r1", undefined);
-  const first = state.pending!;
-  const rejected = first.calls()[0]!.result.then(
+  const rejected = state.pending!.calls()[0]!.result.then(
     () => false,
     () => true,
   );
-  await run("r2", undefined);
+  // The user interrupted the tool and wrote a new message instead.
+  await run("r2", undefined, {
+    request: {
+      model: "claude-sonnet-5-5",
+      messages: [
+        { role: "user", content: "find x" },
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "lookup", input: { q: "x" } }] },
+        { role: "user", content: "never mind" },
+      ],
+      tools: [lookupTool],
+    },
+  });
   assert.equal(await rejected, true);
   assert.equal(state.calls, 2);
+  runner.closeAll();
+});
+
+test("an unrelated request with the same key leaves a parked turn alone", async () => {
+  const { runner, state, run } = toolRunner(["t1"], { maxConcurrency: 2 });
+  await run("r1", undefined);
+  // A second agent of the same client session starts its own turn.
+  await run("r2", undefined);
+  const second = await run("r3", ["t1"]);
+  assert.equal(second.reused, true);
+  assert.deepEqual(second.response.content[0], { type: "text", text: "done" });
+  assert.equal(state.calls, 2);
+  runner.closeAll();
+});
+
+test("a waiting request evicts a parked turn once its grace period is over", async () => {
+  const { runner, state, run } = toolRunner(["t1"], { parkedEvictableAfterMs: 40 });
+  await run("r1", undefined);
+  const parked = state.pending!;
+  const started = Date.now();
+  await run("r2", undefined, { conversationKey: "other" });
+  assert.ok(Date.now() - started >= 30);
+  assert.equal(state.calls, 2);
+  assert.deepEqual(parked.pendingIds(), []);
+  runner.closeAll();
+});
+
+test("an idle process is evicted before a parked turn", async () => {
+  const received: string[] = [];
+  const counter = { calls: 0 };
+  const tools = { calls: 0, results: [] as unknown[], pending: undefined as PendingToolRegistry | undefined };
+  const toolProcess = toolQuery(["t1"], tools);
+  const textProcess = persistentQuery(received, counter);
+  const runner = new ClaudeRunner(
+    { ...config, maxConcurrency: 2, sessionIdleMs: 60_000, parkedEvictableAfterMs: 1 },
+    createLogger("error"),
+    ((params: { prompt: AsyncIterable<unknown>; options: Record<string, unknown> }) =>
+      params.options.mcpServers ? toolProcess(params) : textProcess(params)) as never,
+    () => (tools.pending = new PendingToolRegistry()),
+  );
+  const run = (key: string, request: Record<string, unknown>) =>
+    runner.run({
+      conversationKey: key,
+      request: { model: "claude-sonnet-5-5", ...request } as never,
+      signal: new AbortController().signal,
+      requestId: key,
+      stream: false,
+    });
+
+  await run("tools", { messages: [{ role: "user", content: "find x" }], tools: [lookupTool] });
+  const parked = tools.pending!;
+  await run("idle", { messages: [{ role: "user", content: "one" }] });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await run("third", { messages: [{ role: "user", content: "two" }] });
+
+  assert.deepEqual(parked.pendingIds(), ["t1"]);
+  assert.equal(counter.calls, 2);
+  runner.closeAll();
+});
+
+test("a request that finds no free process in time gets a 529 with retry-after", async () => {
+  const { runner, run } = toolRunner(["t1"], { queueTimeoutMs: 30 });
+  await run("r1", undefined);
+  await assert.rejects(
+    () => run("r2", undefined, { conversationKey: "other" }),
+    (error: unknown) =>
+      error instanceof ApiError &&
+      error.status === 529 &&
+      error.type === "overloaded_error" &&
+      error.retryAfter === 10,
+  );
+  runner.closeAll();
+});
+
+test("a request waiting for a slot does not block tool results under its own key", async () => {
+  const { runner, state, run } = toolRunner(["t1"], { maxConcurrency: 1, queueTimeoutMs: 500 });
+  await run("r1", undefined);
+
+  // Another agent shares the conversation key and waits for the only slot.
+  const decisions: ResumeDecision[] = [];
+  let planned = 0;
+  const queued = run("r2", undefined, {
+    plan: () => {
+      planned += 1;
+      return { kind: "fresh" };
+    },
+    release: (decision) => {
+      decisions.push(decision);
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(state.calls, 1);
+
+  const second = await run("r3", ["t1"]);
+  assert.equal(second.reused, true);
+  assert.deepEqual(second.response.content[0], { type: "text", text: "done" });
+  // The waiting request gave its plan back and planned again once it had a slot.
+  assert.equal((await queued).parked, true);
+  assert.equal(planned, 2);
+  assert.deepEqual(decisions, [{ kind: "fresh" }]);
+  assert.equal(state.calls, 2);
+  runner.closeAll();
+});
+
+test("a request queued behind a process that is still starting evicts it once parked", async () => {
+  const { runner, state, run } = toolRunner(["t1"], {
+    maxConcurrency: 1,
+    parkedEvictableAfterMs: 40,
+    queueTimeoutMs: 1000,
+  });
+  const first = run("r1", undefined);
+  const second = run("r2", undefined, { conversationKey: "other" });
+  assert.equal((await first).parked, true);
+  assert.equal((await second).parked, true);
+  assert.equal(state.calls, 2);
+  runner.closeAll();
+});
+
+test("a request cancelled before it queues does not wait for a slot", async () => {
+  const { runner, state, run } = toolRunner(["t1"], { maxConcurrency: 1, queueTimeoutMs: 0 });
+  await run("r1", undefined);
+  const controller = new AbortController();
+  await assert.rejects(
+    () =>
+      run("r2", undefined, {
+        conversationKey: "other",
+        signal: controller.signal,
+        // The client goes away while the request is being planned.
+        plan: () => {
+          controller.abort();
+          return { kind: "fresh" };
+        },
+      }),
+    (error: unknown) => error instanceof ClientAbort,
+  );
+  assert.equal(state.calls, 1);
   runner.closeAll();
 });
 
