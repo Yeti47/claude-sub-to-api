@@ -889,6 +889,71 @@ test("a request that finds no free process in time gets a 529 with retry-after",
   runner.closeAll();
 });
 
+test("a request waiting for a slot does not block tool results under its own key", async () => {
+  const { runner, state, run } = toolRunner(["t1"], { maxConcurrency: 1, queueTimeoutMs: 500 });
+  await run("r1", undefined);
+
+  // Another agent shares the conversation key and waits for the only slot.
+  const decisions: ResumeDecision[] = [];
+  let planned = 0;
+  const queued = run("r2", undefined, {
+    plan: () => {
+      planned += 1;
+      return { kind: "fresh" };
+    },
+    release: (decision) => {
+      decisions.push(decision);
+    },
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(state.calls, 1);
+
+  const second = await run("r3", ["t1"]);
+  assert.equal(second.reused, true);
+  assert.deepEqual(second.response.content[0], { type: "text", text: "done" });
+  // The waiting request gave its plan back and planned again once it had a slot.
+  assert.equal((await queued).parked, true);
+  assert.equal(planned, 2);
+  assert.deepEqual(decisions, [{ kind: "fresh" }]);
+  assert.equal(state.calls, 2);
+  runner.closeAll();
+});
+
+test("a request queued behind a process that is still starting evicts it once parked", async () => {
+  const { runner, state, run } = toolRunner(["t1"], {
+    maxConcurrency: 1,
+    parkedEvictableAfterMs: 40,
+    queueTimeoutMs: 1000,
+  });
+  const first = run("r1", undefined);
+  const second = run("r2", undefined, { conversationKey: "other" });
+  assert.equal((await first).parked, true);
+  assert.equal((await second).parked, true);
+  assert.equal(state.calls, 2);
+  runner.closeAll();
+});
+
+test("a request cancelled before it queues does not wait for a slot", async () => {
+  const { runner, state, run } = toolRunner(["t1"], { maxConcurrency: 1, queueTimeoutMs: 0 });
+  await run("r1", undefined);
+  const controller = new AbortController();
+  await assert.rejects(
+    () =>
+      run("r2", undefined, {
+        conversationKey: "other",
+        signal: controller.signal,
+        // The client goes away while the request is being planned.
+        plan: () => {
+          controller.abort();
+          return { kind: "fresh" };
+        },
+      }),
+    (error: unknown) => error instanceof ClientAbort,
+  );
+  assert.equal(state.calls, 1);
+  runner.closeAll();
+});
+
 test("maps upstream HTTP statuses to Anthropic error statuses", async () => {
   const cases: Array<[number, number, string]> = [
     [529, 529, "overloaded_error"],

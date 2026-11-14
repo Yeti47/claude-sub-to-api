@@ -120,6 +120,14 @@ interface Delivery {
   sent: boolean;
 }
 
+/** A process slot acquired outside the conversation lock, until a launch takes it. */
+interface Slot {
+  release?: () => void;
+}
+
+/** No process slot is free; the request waits for one and plans again. */
+class NeedsSlot extends Error {}
+
 /** How a new process is launched. */
 interface Launch {
   prepared: PreparedTurn;
@@ -143,21 +151,35 @@ export class ClaudeRunner {
   }
 
   async run(input: RunInput): Promise<RunResult> {
-    while (true) {
-      const key = this.lockKey(input);
-      let release: (() => void) | undefined;
-      try {
-        release = await this.locks.acquire(key, input.signal);
-      } catch {
-        throw new ClientAbort();
+    const slot: Slot = {};
+    let budget = this.config.queueTimeoutMs;
+    try {
+      while (true) {
+        const key = this.lockKey(input);
+        let release: (() => void) | undefined;
+        try {
+          release = await this.locks.acquire(key, input.signal);
+        } catch {
+          throw new ClientAbort();
+        }
+        try {
+          // The parked turn may have been answered or closed while waiting.
+          if (this.lockKey(input) !== key) continue;
+          return await this.runLocked(input, slot);
+        } catch (error) {
+          if (!(error instanceof NeedsSlot)) throw error;
+        } finally {
+          release();
+        }
+        // Capacity is awaited without the conversation lock, so tool results
+        // for a turn parked under this key still reach it. The request then
+        // plans again: the history may have moved on in the meantime.
+        const started = Date.now();
+        slot.release = await this.acquireSlot(input.signal, budget);
+        if (budget > 0) budget = Math.max(1, budget - (Date.now() - started));
       }
-      try {
-        // The parked turn may have been answered or closed while waiting.
-        if (this.lockKey(input) !== key) continue;
-        return await this.runLocked(input);
-      } finally {
-        release();
-      }
+    } finally {
+      slot.release?.();
     }
   }
 
@@ -176,7 +198,7 @@ export class ClaudeRunner {
     for (const process of [...this.processes]) process.close(reason);
   }
 
-  private async runLocked(input: RunInput): Promise<RunResult> {
+  private async runLocked(input: RunInput, slot: Slot): Promise<RunResult> {
     if (input.signal.aborted) throw new ClientAbort();
 
     const toolResults = lastToolResults(input.request.messages);
@@ -210,7 +232,7 @@ export class ClaudeRunner {
 
     const delivery: Delivery = { sent: false };
     try {
-      return await this.runDecided(input, decision, delivery);
+      return await this.runDecided(input, decision, delivery, slot);
     } catch (error) {
       if (!delivery.sent) input.release?.(decision);
       throw error;
@@ -265,6 +287,7 @@ export class ClaudeRunner {
     input: RunInput,
     planned: ResumeDecision,
     delivery: Delivery,
+    slot: Slot,
   ): Promise<RunResult> {
     let decision = planned;
     // This conversation moved to a fork, so its idle process on the source
@@ -280,6 +303,8 @@ export class ClaudeRunner {
           live.close("Forking the conversation history");
         }
       }
+      // A fork always starts a process; do not copy a transcript to wait.
+      this.reserve(slot);
     }
 
     let resumeSessionId: string | undefined;
@@ -332,7 +357,7 @@ export class ClaudeRunner {
         input.record?.(result, decision);
         return result;
       }
-      const result = await this.startProcess(input, launch, delivery);
+      const result = await this.startProcess(input, launch, delivery, slot);
       if (resumeSessionId !== undefined) result.resumed = true;
       if (forked) result.forked = true;
       input.record?.(result, decision);
@@ -349,6 +374,7 @@ export class ClaudeRunner {
         input,
         { prepared: replay, launchKey: launchKey(this.config, input.request, replay) },
         delivery,
+        slot,
       );
       input.record?.(result, { kind: "fresh" });
       return result;
@@ -388,12 +414,12 @@ export class ClaudeRunner {
     input: RunInput,
     launch: Launch,
     delivery: Delivery,
+    slot: Slot,
   ): Promise<RunResult> {
-    const release = await this.acquireSlot(input.signal);
-    if (input.signal.aborted) {
-      release();
-      throw new ClientAbort();
-    }
+    if (input.signal.aborted) throw new ClientAbort();
+    this.reserve(slot);
+    const release = slot.release!;
+    slot.release = undefined;
     let process: LiveProcess | undefined;
     try {
       const { request, requestId } = input;
@@ -441,22 +467,29 @@ export class ClaudeRunner {
     return this.consume(process, input, launch.resumeSessionId !== undefined);
   }
 
+  /** Take a free process slot, or have the request wait for one unlocked. */
+  private reserve(slot: Slot): void {
+    slot.release ??= this.limit.tryAcquire();
+    if (!slot.release) throw new NeedsSlot();
+  }
+
   /**
    * Wait for a process slot. While every slot is taken, processes nobody is
    * actively using are closed to make room; a request that still has no slot
-   * after `queueTimeoutMs` is turned away so the client can back off.
+   * after `timeoutMs` is turned away so the client can back off.
    */
-  private async acquireSlot(signal: AbortSignal): Promise<() => void> {
+  private async acquireSlot(signal: AbortSignal, timeoutMs: number): Promise<() => void> {
+    if (signal.aborted) throw new ClientAbort();
     const wait = new AbortController();
     const onAbort = () => wait.abort();
     signal.addEventListener("abort", onAbort, { once: true });
     let timedOut = false;
     const timeout =
-      this.config.queueTimeoutMs > 0
+      timeoutMs > 0
         ? setTimeout(() => {
             timedOut = true;
             wait.abort();
-          }, this.config.queueTimeoutMs)
+          }, timeoutMs)
         : undefined;
     timeout?.unref?.();
     // A parked turn becomes evictable as it ages, so keep looking.
@@ -465,10 +498,11 @@ export class ClaudeRunner {
       recheck = setTimeout(makeRoom, this.evict() ? 50 : this.nextEvictionMs());
       recheck.unref?.();
     };
-    if (this.processes.size >= this.config.maxConcurrency) makeRoom();
     try {
-      const release = await this.limit.acquire(wait.signal);
-      return release;
+      const permit = this.limit.acquire(wait.signal);
+      // Queued behind a permit, whether or not its process exists yet.
+      if (this.limit.waiting > 0) makeRoom();
+      return await permit;
     } catch {
       if (!timedOut || signal.aborted) throw new ClientAbort();
       throw new ApiError(
@@ -520,7 +554,8 @@ export class ClaudeRunner {
     const waits = [...this.processes]
       .filter((process) => process.status === "parked")
       .map((process) => process.lastUsed + grace - now);
-    return Math.min(1000, Math.max(10, ...(waits.length ? [Math.min(...waits)] : [1000])));
+    // A turn that parks from now on is not evictable before its grace period.
+    return Math.min(1000, Math.max(10, waits.length ? Math.min(...waits) : grace));
   }
 
   /**

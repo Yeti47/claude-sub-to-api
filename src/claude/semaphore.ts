@@ -16,6 +16,13 @@ export class Semaphore {
     return this.waiters.length;
   }
 
+  /** A permit if one is free and nobody is waiting for it. */
+  tryAcquire(): (() => void) | undefined {
+    if (this.active >= this.size || this.waiters.length > 0) return undefined;
+    this.active += 1;
+    return this.makeRelease();
+  }
+
   async acquire(signal?: AbortSignal): Promise<() => void> {
     if (signal?.aborted) throw new Error("aborted");
     if (this.active < this.size && this.waiters.length === 0) {
