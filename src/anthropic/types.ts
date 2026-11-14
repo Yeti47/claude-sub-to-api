@@ -61,8 +61,17 @@ export interface ToolResultBlock {
   cache_control?: CacheControl;
 }
 
+/** The summary that stands in for the messages a compaction replaced. */
+export interface CompactionBlock {
+  type: "compaction";
+  content: string | null;
+  signature?: string;
+  cache_control?: CacheControl;
+}
+
 export type ContentBlock =
   | TextBlock
+  | CompactionBlock
   | ThinkingBlock
   | RedactedThinkingBlock
   | ImageBlock
@@ -110,6 +119,9 @@ export interface MessagesRequest {
   thinking?: ThinkingConfig;
   service_tier?: string;
   output_config?: { effort?: string; [key: string]: unknown };
+  /** On-demand compaction: answer with a summary of the conversation. */
+  compaction?: { type: string; instructions?: string | null } | null;
+  context_management?: { edits?: Array<{ type?: string; [key: string]: unknown }> };
 }
 
 export interface Usage {
@@ -117,6 +129,14 @@ export interface Usage {
   output_tokens: number;
   cache_creation_input_tokens?: number;
   cache_read_input_tokens?: number;
+  /** The model calls behind a response that is not itself a reply, such as a compaction. */
+  iterations?: Array<{
+    type: string;
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
+  }>;
 }
 
 export interface MessagesResponse {
@@ -137,6 +157,7 @@ export const STOP_REASONS = [
   "tool_use",
   "pause_turn",
   "refusal",
+  "compaction",
 ] as const;
 
 export function normalizeStopReason(value: unknown): string | null {

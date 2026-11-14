@@ -320,3 +320,99 @@ test("estimates input tokens without running a turn", async () => {
   );
   assert.equal(runs, 0);
 });
+
+test("answers a compaction request with a summary block and no checkpoint", async () => {
+  const sessions = new SessionStore(undefined, createLogger("error"));
+  const plans: ResumeDecision[] = [];
+  const seen: Array<{ last: unknown; noToolCalls?: boolean }> = [];
+  const runner = {
+    run: async (input: {
+      request: { messages: Array<{ content: unknown }>; compaction?: unknown };
+      noToolCalls?: boolean;
+      onEvent?: (event: Record<string, unknown>) => void;
+      plan?: () => ResumeDecision;
+      record?: (result: RunResult, decision?: ResumeDecision) => void;
+    }) => {
+      const decision = input.plan?.() ?? { kind: "fresh" };
+      plans.push(decision);
+      seen.push({ last: input.request.messages.at(-1)?.content, noToolCalls: input.noToolCalls });
+      input.onEvent?.({ type: "message_start", message: { id: "msg_1" } });
+      input.onEvent?.({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+      input.onEvent?.({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hello" } });
+      const result: RunResult = { response, sessionId: "session-test", leafUuid: `leaf-${plans.length}` };
+      input.record?.(result, decision);
+      return result;
+    },
+  };
+  const turns = [
+    { role: "user", content: "hi" },
+    { role: "assistant", content: "hello" },
+    { role: "user", content: "again" },
+    { role: "assistant", content: "hello" },
+  ];
+
+  await withServer(
+    async (base) => {
+      const send = (payload: Record<string, unknown>) =>
+        fetch(`${base}/v1/messages`, {
+          method: "POST",
+          headers: { "x-api-key": "secret", "content-type": "application/json" },
+          body: JSON.stringify({ model: "claude-sonnet-5-5", max_tokens: 10, ...payload }),
+        });
+
+      assert.equal((await send({ messages: turns.slice(0, 1) })).status, 200);
+      assert.equal((await send({ messages: turns.slice(0, 3) })).status, 200);
+
+      const compacted = await send({ messages: turns, compaction: { type: "summarize" } });
+      assert.equal(compacted.status, 200);
+      const json = (await compacted.json()) as MessagesResponse;
+      assert.equal(json.stop_reason, "compaction");
+      assert.equal(json.content.length, 1);
+      assert.equal(json.content[0]?.type, "compaction");
+      assert.equal((json.content[0] as { content: string }).content, "hello");
+      assert.equal(json.usage.input_tokens, 0);
+      assert.deepEqual(json.usage.iterations, [{ type: "compaction", input_tokens: 3, output_tokens: 1 }]);
+
+      const streamed = await send({ messages: turns, compaction: { type: "summarize" }, stream: true });
+      assert.equal(streamed.status, 200);
+      const text = await streamed.text();
+      assert.deepEqual(
+        [...text.matchAll(/^event: (\w+)$/gm)].map((match) => match[1]),
+        ["message_start", "content_block_start", "content_block_stop", "message_delta", "message_stop"],
+      );
+      assert.match(text, /"content_block":\{"type":"compaction","content":"hello"/);
+      assert.match(text, /"stop_reason":"compaction"/);
+      assert.doesNotMatch(text, /text_delta/);
+
+      // The conversation continues from the block.
+      const next = await send({
+        messages: [{ role: "assistant", content: json.content }, { role: "user", content: "more" }],
+      });
+      assert.equal(next.status, 200);
+
+      const combined = await send({
+        messages: turns,
+        compaction: { type: "summarize" },
+        context_management: { edits: [{ type: "compact_20260112" }] },
+      });
+      assert.equal(combined.status, 400);
+      // A threshold edit alone is ignored, not refused.
+      const threshold = await send({
+        messages: turns.slice(0, 1),
+        context_management: { edits: [{ type: "compact_20260112" }] },
+      });
+      assert.equal(threshold.status, 200);
+    },
+    { runner: runner as never, sessions },
+  );
+
+  // The summary is written on the conversation's own session.
+  assert.equal(plans[2]?.kind, "resume");
+  assert.match(String(seen[2]?.last), /summary/i);
+  assert.equal(seen[2]?.noToolCalls, true);
+  assert.equal(seen[0]?.noToolCalls, false);
+  // That exchange is no checkpoint: the same history now forks before it.
+  assert.equal(plans[3]?.kind, "fork");
+  if (plans[3]?.kind === "fork") assert.equal(plans[3].upToMessageId, "leaf-2");
+  assert.equal(plans[4]?.kind, "fresh");
+});

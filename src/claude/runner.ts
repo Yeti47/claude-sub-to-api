@@ -75,6 +75,8 @@ export interface RunInput {
   resumeFromIndex?: number;
   /** Persist the CLI transcript so a later request can resume it. */
   persistSession?: boolean;
+  /** Nobody will answer a tool call of this turn: one ends it instead of parking it. */
+  noToolCalls?: boolean;
   /**
    * Compute the resume/fork decision inside the conversation lock, and claim
    * the session it names.
@@ -636,6 +638,10 @@ export class ClaudeRunner {
 
         if (assembler.sawToolUse && assembler.sawMessageStop) {
           const response = assembler.response();
+          if (input.noToolCalls) {
+            process.close("Tool call in a turn that takes none");
+            return { response, sessionId: process.sessionId };
+          }
           const blocks = response.content.filter(
             (block): block is ToolUseBlock => block.type === "tool_use",
           );

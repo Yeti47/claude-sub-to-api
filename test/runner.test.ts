@@ -1236,3 +1236,17 @@ test("the proxy's own API key is not passed to the Claude process", async () => 
   assert.equal(env.PROXY_API_KEY, undefined);
   runner.closeAll();
 });
+
+test("a turn that takes no tool calls ends on one instead of parking", async () => {
+  const { runner, state, run } = toolRunner(["t1"]);
+  const result = await run("r1", undefined, { noToolCalls: true });
+  assert.equal(result.parked, undefined);
+  assert.equal(result.response.stop_reason, "tool_use");
+  assert.equal(result.response.content[0]?.type, "tool_use");
+  // The process is gone, so nothing waits for a result that will not come.
+  assert.equal(runner.isLive(result.sessionId ?? ""), false);
+  const again = await run("r2", undefined, { noToolCalls: true });
+  assert.equal(again.response.stop_reason, "tool_use");
+  assert.equal(state.calls, 2);
+  runner.closeAll();
+});

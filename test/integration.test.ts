@@ -53,3 +53,39 @@ test("live models", { skip }, async () => {
   const json = (await res.json()) as { data: unknown[] };
   assert.ok(json.data.length > 0);
 });
+
+test("live compaction and continuing from the block", { skip }, async () => {
+  const post = async (payload: Record<string, unknown>) => {
+    const res = await fetch(`${base}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": key! },
+      body: JSON.stringify({ model: request.model, ...payload }),
+    });
+    assert.equal(res.status, 200);
+    return (await res.json()) as {
+      content: Array<{ type: string; text?: string; content?: string }>;
+      stop_reason: string;
+    };
+  };
+  const summary = await post({
+    max_tokens: 2048,
+    messages: [
+      { role: "user", content: "Remember this code word: heliotrope. Reply with OK." },
+      { role: "assistant", content: "OK" },
+    ],
+    compaction: { type: "summarize" },
+  });
+  assert.equal(summary.stop_reason, "compaction");
+  assert.equal(summary.content.length, 1);
+  assert.equal(summary.content[0]?.type, "compaction");
+  assert.match(summary.content[0]?.content ?? "", /heliotrope/i);
+
+  const next = await post({
+    max_tokens: 64,
+    messages: [
+      { role: "assistant", content: summary.content },
+      { role: "user", content: "What is the code word? Reply with the word only." },
+    ],
+  });
+  assert.match(next.content.map((block) => block.text ?? "").join(""), /heliotrope/i);
+});
