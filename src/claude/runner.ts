@@ -74,7 +74,11 @@ export interface RunInput {
    * the session it names.
    */
   plan?: () => ResumeDecision;
-  /** Give back a claimed session whose turn failed. */
+  /**
+   * Give back a claimed session whose turn never reached its process. Once
+   * the prompt was sent, a failed turn may have left a partial exchange in
+   * the transcript, so the claim stays and a retry forks at the checkpoint.
+   */
   release?: (decision: ResumeDecision) => void;
   /** Drop a session whose transcript turned out to be missing. */
   forget?: (sessionId: string) => void;
@@ -110,6 +114,11 @@ export type QueryFactory = (params: {
   prompt: AsyncIterable<SDKUserMessage>;
   options: Record<string, unknown>;
 }) => QueryHandle;
+
+/** Whether a turn's prompt was handed to a Claude process. */
+interface Delivery {
+  sent: boolean;
+}
 
 /** How a new process is launched. */
 interface Launch {
@@ -193,10 +202,11 @@ export class ClaudeRunner {
           }
         : { kind: "fresh" };
 
+    const delivery: Delivery = { sent: false };
     try {
-      return await this.runDecided(input, decision);
+      return await this.runDecided(input, decision, delivery);
     } catch (error) {
-      input.release?.(decision);
+      if (!delivery.sent) input.release?.(decision);
       throw error;
     }
   }
@@ -245,7 +255,11 @@ export class ClaudeRunner {
     return result;
   }
 
-  private async runDecided(input: RunInput, planned: ResumeDecision): Promise<RunResult> {
+  private async runDecided(
+    input: RunInput,
+    planned: ResumeDecision,
+    delivery: Delivery,
+  ): Promise<RunResult> {
     let decision = planned;
     // This conversation moved to a fork, so its idle process on the source
     // session is superseded. Closing it also keeps the CLI from appending to
@@ -307,11 +321,12 @@ export class ClaudeRunner {
         live.begin();
         live.pending.beginPhase();
         live.input.push({ ...prepared.prompt, uuid: randomUUID() } as SDKUserMessage);
+        delivery.sent = true;
         const result = { ...(await this.consume(live, input, false)), reused: true, forked };
         input.record?.(result, decision);
         return result;
       }
-      const result = await this.startProcess(input, launch);
+      const result = await this.startProcess(input, launch, delivery);
       if (resumeSessionId !== undefined) result.resumed = true;
       if (forked) result.forked = true;
       input.record?.(result, decision);
@@ -324,10 +339,11 @@ export class ClaudeRunner {
       });
       if (resumeSessionId) input.forget?.(resumeSessionId);
       const replay = prepareTurn(input.request);
-      const result = await this.startProcess(input, {
-        prepared: replay,
-        launchKey: launchKey(this.config, input.request, replay),
-      });
+      const result = await this.startProcess(
+        input,
+        { prepared: replay, launchKey: launchKey(this.config, input.request, replay) },
+        delivery,
+      );
       input.record?.(result, { kind: "fresh" });
       return result;
     }
@@ -362,7 +378,11 @@ export class ClaudeRunner {
     }
   }
 
-  private async startProcess(input: RunInput, launch: Launch): Promise<RunResult> {
+  private async startProcess(
+    input: RunInput,
+    launch: Launch,
+    delivery: Delivery,
+  ): Promise<RunResult> {
     const release = await this.acquireSlot(input.signal);
     if (input.signal.aborted) {
       release();
@@ -406,6 +426,7 @@ export class ClaudeRunner {
       });
       this.processes.add(process);
       inputQueue.push({ ...launch.prepared.prompt, uuid: randomUUID() } as SDKUserMessage);
+      delivery.sent = true;
     } catch (error) {
       if (process) process.close("Failed to start turn");
       else release();
