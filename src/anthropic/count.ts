@@ -29,6 +29,8 @@ function blockTokens(block: ContentBlock): number {
       return textTokens(block.thinking);
     case "redacted_thinking":
       return textTokens(block.data);
+    case "compaction":
+      return textTokens(block.content ?? "");
     case "image":
       return IMAGE_TOKENS;
     case "document":

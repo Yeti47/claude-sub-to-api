@@ -96,6 +96,14 @@ function blockParts(block: ContentBlock, role: "user" | "assistant"): {
       // Replaying chain-of-thought from a previous API call is neither
       // necessary nor desirable for a fresh agent session.
       return { text: "", media: [] };
+    case "compaction":
+      // The client sends this block in place of the messages it summarizes.
+      return {
+        text: block.content
+          ? `<conversation_summary>\nThe earlier part of this conversation was replaced by this summary:\n${block.content}\n</conversation_summary>`
+          : "",
+        media: [],
+      };
     case "image":
       return { text: "", media: [block] };
     case "document":

@@ -162,6 +162,20 @@ Prompt caching improves when:
 
 When Claude calls a client tool, the proxy does not end the CLI turn. The MCP handler blocks, the `tool_use` response is sent, and the process stays alive. The follow-up request is matched to that process by its `tool_use_id`s: it resolves the handlers and continues the same live turn, so the session and cache stay intact. The streamed `message_stop` of a tool-call message is sent only once the turn is parked, so results sent immediately always find it. A follow-up that answers only some of the calls is rejected with a 400 and the turn stays parked. A request whose history shows the client moved past a tool call without answering it closes the turn parked on that call. Tool results that arrive with a different model, system prompt or tool set than the parked turn was started with do not continue it; that turn is closed and the request is handled like a rewritten history. A turn nobody resumes is closed after `PARKED_TURN_TTL_MS` (30 minutes by default), or earlier when its process slot is needed (see `PARKED_EVICTABLE_AFTER_MS`).
 
+## Compaction
+
+Clients that compact their own history need nothing from the proxy: the rewritten history is replayed into a fresh session.
+
+[On-demand compaction](https://platform.claude.com/docs/en/build-with-claude/compaction-on-demand) is supported. A request with `"compaction": {"type": "summarize"}` is answered with a single `compaction` block and `stop_reason: "compaction"` instead of a reply; `instructions` replaces the default summarization prompt. The summary is written by one more turn on the conversation's session, so it reads the history from the prompt cache, and that turn's usage is reported in `usage.iterations`. Send the block back first in `messages`, in place of the messages it summarizes; Claude then receives the summary there. The `anthropic-beta` header is not required.
+
+As with the Messages API, no summary comes back when the turn is cut off, refused or calls a tool: the response is a `200` with empty `content` and the `stop_reason` the turn ended with. The request is rejected with a `400` when it is combined with `context_management`, `stop_sequences`, a `tool_choice` of `any` or `tool`, or `output_config.format`, or when the last assistant turn has a tool call without a result.
+
+Differences from the Messages API:
+
+- The block's `signature` is a checksum and is not verified. A block issued by the Messages API is accepted too.
+- A streamed compaction sends `message_start` when the summarizing turn starts and the block when it is done.
+- Threshold compaction (a `compact_20260112` edit in `context_management`) is not supported. The edit is ignored and logged once as a warning, so the conversation is never compacted for the client: it has to compact on demand or by itself before the context window fills up. Other `context_management` edits are ignored as well.
+
 ## Configuration
 
 All configuration is environment-based.

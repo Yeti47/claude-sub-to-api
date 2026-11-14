@@ -34,6 +34,8 @@ function hashBlock(block: ContentBlock): string {
       return `thinking:${block.thinking}`;
     case "redacted_thinking":
       return `redacted_thinking:${block.data}`;
+    case "compaction":
+      return `compaction:${block.content ?? ""}`;
     default:
       return sha1(JSON.stringify(block));
   }

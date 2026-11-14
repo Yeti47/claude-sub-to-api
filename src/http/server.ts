@@ -11,6 +11,15 @@ import type { ModelCatalog } from "../claude/models.js";
 import type { SessionStore, ResumeDecision } from "../session/store.js";
 import { deriveConversationKey, systemHash } from "../session/hashes.js";
 import { estimateInputTokens } from "../anthropic/count.js";
+import {
+  compactionResponse,
+  compactionStreamEnd,
+  compactionStreamStart,
+  summarizeTurn,
+  validateCompaction,
+  wantsCompaction,
+  wantsThresholdCompaction,
+} from "../anthropic/compaction.js";
 import { SseWriter } from "./sse.js";
 
 const MAX_BODY = 32 << 20;
@@ -35,6 +44,7 @@ function sessionHeader(req: IncomingMessage): string | undefined {
 
 export function createHandler(deps: Deps) {
   const { config, logger } = deps;
+  let warnedThreshold = false;
 
   return async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const requestId = randomUUID();
@@ -111,6 +121,21 @@ export function createHandler(deps: Deps) {
       return;
     }
 
+    // A compaction request runs one more turn on the conversation, the one
+    // that writes its summary; the reply is reshaped into a compaction block.
+    const compacting = wantsCompaction(request);
+    if (compacting) {
+      const problem = validateCompaction(request);
+      if (problem) return sendError(res, 400, "invalid_request_error", problem);
+    } else if (wantsThresholdCompaction(request) && !warnedThreshold) {
+      warnedThreshold = true;
+      logger.warn(
+        "context_management compact_20260112 is not supported and is ignored; the conversation is not compacted at a threshold",
+        { requestId },
+      );
+    }
+    const turn = compacting ? summarizeTurn(request) : request;
+
     const stream = request.stream === true;
     const controller = new AbortController();
     let timedOut = false;
@@ -143,7 +168,7 @@ export function createHandler(deps: Deps) {
     const plan = () => {
       const decision = deps.sessions.plan({
         ...scope,
-        messages: request.messages,
+        messages: turn.messages,
         now: Date.now(),
       });
       deps.sessions.claim(decision);
@@ -155,35 +180,54 @@ export function createHandler(deps: Deps) {
         ...scope,
         sessionId: result.sessionId,
         history: [
-          ...request.messages,
+          ...turn.messages,
           { role: "assistant", content: result.response.content },
         ],
         leafUuid: result.leafUuid,
-        parked: Boolean(result.parked),
+        // The summarizing exchange is not part of the client's history, so it
+        // is no checkpoint: a request that continues the old history forks
+        // before it.
+        parked: Boolean(result.parked) || compacting,
       });
     };
     const release = (decision: ResumeDecision) => deps.sessions.release(decision);
     const forget = (sessionId: string) => deps.sessions.forget(sessionId);
+
+    // A streamed compaction opens when the summarizing turn does, which keeps
+    // the connection warm, and carries none of that turn's own events.
+    let opened = false;
+    const onEvent = (event: Record<string, unknown>) => {
+      if (!compacting) return writer!.event(event);
+      if (event.type !== "message_start" || opened) return;
+      opened = true;
+      const id = (event.message as { id?: unknown } | undefined)?.id;
+      writer!.event(compactionStreamStart(String(id ?? `msg_${requestId}`), request.model));
+    };
 
     try {
       // The runner routes the request: tool results continue the parked turn
       // that asked for them, anything else follows the session plan.
       const result = await deps.runner.run({
         conversationKey: key,
-        request,
+        request: turn,
         signal: controller.signal,
         requestId,
         stream,
-        onEvent: writer ? (event) => writer!.event(event) : undefined,
+        onEvent: writer ? onEvent : undefined,
         persistSession: true,
+        noToolCalls: compacting,
         plan,
         record,
         release,
         forget,
       });
 
-      const response = result.response;
+      const response = compacting ? compactionResponse(result.response) : result.response;
       if (writer) {
+        if (compacting) {
+          if (!opened) writer.event(compactionStreamStart(response.id, request.model));
+          for (const event of compactionStreamEnd(response)) writer.event(event);
+        }
         writer.finish();
       } else {
         res.writeHead(200, { "content-type": "application/json" });
@@ -194,16 +238,17 @@ export function createHandler(deps: Deps) {
         model: request.model,
         stream,
         status: 200,
+        compaction: compacting || undefined,
         resumed: Boolean(result.resumed),
         forked: Boolean(result.forked),
         reused: Boolean(result.reused),
         parked: Boolean(result.parked),
         sessionId: result.sessionId,
         ms: Date.now() - started,
-        input_tokens: response.usage.input_tokens,
-        output_tokens: response.usage.output_tokens,
-        cache_read_input_tokens: response.usage.cache_read_input_tokens,
-        cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
+        input_tokens: result.response.usage.input_tokens,
+        output_tokens: result.response.usage.output_tokens,
+        cache_read_input_tokens: result.response.usage.cache_read_input_tokens,
+        cache_creation_input_tokens: result.response.usage.cache_creation_input_tokens,
       });
     } catch (error) {
       if (error instanceof ClientAbort) {
