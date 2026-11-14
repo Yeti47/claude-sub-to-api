@@ -2,7 +2,13 @@
 import { errorMessage } from "../logger.js";
 
 export class ApiError extends Error {
-  constructor(readonly status: number, readonly type: string, message: string) {
+  constructor(
+    readonly status: number,
+    readonly type: string,
+    message: string,
+    /** Seconds the client should wait before retrying, when known. */
+    readonly retryAfter?: number,
+  ) {
     super(message);
     this.name = "ApiError";
   }
@@ -48,18 +54,21 @@ export function errorFor(result: {
     ? ` Resets at ${new Date(result.resetAt).toISOString()}.`
     : "";
   const message = `${result.message}${reset}`;
+  const retryAfter = result.resetAt
+    ? Math.max(1, Math.ceil((result.resetAt - Date.now()) / 1000))
+    : undefined;
 
   if (result.status !== undefined) {
     if (result.status === 401) return new ApiError(401, "authentication_error", message);
     if (result.status === 403) return new ApiError(403, "permission_error", message);
     if (result.status === 404) return new ApiError(404, "not_found_error", message);
-    if (result.status === 429) return new ApiError(429, "rate_limit_error", message);
+    if (result.status === 429) return new ApiError(429, "rate_limit_error", message, retryAfter);
     if (result.status === 529) return new ApiError(529, "overloaded_error", message);
     if (result.status >= 500) return new ApiError(502, "api_error", message);
     if (result.status >= 400) return new ApiError(400, "invalid_request_error", message);
   }
 
-  if (haystack.includes("rate_limit")) return new ApiError(429, "rate_limit_error", message);
+  if (haystack.includes("rate_limit")) return new ApiError(429, "rate_limit_error", message, retryAfter);
   if (haystack.includes("overloaded")) return new ApiError(529, "overloaded_error", message);
   if (
     haystack.includes("authentication") ||

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ClaudeRunner, ApiError, ClientAbort, type RunResult } from "../src/claude/runner.js";
+import { errorFor } from "../src/claude/errors.js";
 import { PendingToolRegistry } from "../src/claude/pending-tools.js";
 import { createLogger } from "../src/logger.js";
 import type { Config } from "../src/config.js";
@@ -1019,4 +1020,11 @@ test("a retry after a failed turn forks at the last checkpoint", async () => {
   assert.deepEqual(forks, [["session-1", "leaf-1"]]);
   assert.equal(retry.forked, true);
   runner.closeAll();
+});
+
+test("a rate limit with a known reset time carries retry-after", () => {
+  const error = errorFor({ type: "rate_limit", message: "limit", resetAt: Date.now() + 90_000 });
+  assert.equal(error.status, 429);
+  assert.ok(error.retryAfter !== undefined && error.retryAfter >= 89 && error.retryAfter <= 90);
+  assert.equal(errorFor({ type: "rate_limit", message: "limit" }).retryAfter, undefined);
 });
