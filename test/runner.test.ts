@@ -17,6 +17,7 @@ const config: Config = {
   maxConcurrency: 1,
   requestTimeoutMs: 60_000,
   defaultMaxTokens: 100,
+  minCliOutputTokens: 0,
   systemPromptMode: "claude-code",
   parkedTurnTtlMs: 0,
   sessionIdleMs: 0,
@@ -1280,5 +1281,143 @@ test("a turn that takes no tool calls ends on one instead of parking", async () 
   const again = await run("r2", undefined, { noToolCalls: true });
   assert.equal(again.response.stop_reason, "tool_use");
   assert.equal(state.calls, 2);
+  runner.closeAll();
+});
+
+/** A turn whose whole output budget went to reasoning: no text, no tool call. */
+const truncatedTurn = [
+  { type: "stream_event", event: { type: "message_start", message: { id: "msg_t", usage: { input_tokens: 10 } } } },
+  { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } } },
+  { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "weighing the options" } } },
+  { type: "stream_event", event: { type: "content_block_stop", index: 0 } },
+  { type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "max_tokens" }, usage: { output_tokens: 4096 } } },
+  { type: "stream_event", event: { type: "message_stop" } },
+  { type: "result", subtype: "success", is_error: false, result: "", stop_reason: "max_tokens", usage: { input_tokens: 10, output_tokens: 4096 } },
+];
+
+function truncatedRunner() {
+  return new ClaudeRunner(config, createLogger("error"), fakeQuery(truncatedTurn) as never);
+}
+
+function request(overrides: Record<string, unknown> = {}) {
+  return {
+    model: "claude-opus-5-5",
+    max_tokens: 4096,
+    messages: [{ role: "user" as const, content: "hi" }],
+    ...overrides,
+  };
+}
+
+test("a turn cut off at the output limit before any text fails with an actionable error", async () => {
+  const runner = truncatedRunner();
+  await assert.rejects(
+    () =>
+      runner.run({
+        conversationKey: "truncated",
+        request: request(),
+        signal: new AbortController().signal,
+        requestId: "truncated",
+        stream: false,
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof ApiError);
+      assert.equal(error.status, 502);
+      assert.match(error.message, /output token limit/);
+      assert.match(error.message, /4096/);
+      assert.match(error.message, /Raise max_tokens/);
+      return true;
+    },
+  );
+});
+
+test("a reply with only thinking blocks is not sent as an empty answer", async () => {
+  const runner = new ClaudeRunner(config, createLogger("error"), fakeQuery(truncatedTurn) as never);
+  await assert.rejects(
+    () =>
+      runner.run({
+        conversationKey: "thinking-only",
+        request: request({ thinking: { type: "enabled", budget_tokens: 1024 } }),
+        signal: new AbortController().signal,
+        requestId: "thinking-only",
+        stream: false,
+      }),
+    (error: unknown) => error instanceof ApiError && error.status === 502,
+  );
+});
+
+test("a compaction turn may still come back empty with its stop reason", async () => {
+  const runner = truncatedRunner();
+  const { response } = await runner.run({
+    conversationKey: "compaction-empty",
+    request: request(),
+    signal: new AbortController().signal,
+    requestId: "compaction-empty",
+    stream: false,
+    noToolCalls: true,
+  });
+  assert.equal(response.stop_reason, "max_tokens");
+  assert.deepEqual(response.content, []);
+});
+
+test("a refusal without content is a real stop reason, not a failure", async () => {
+  const events = [
+    { type: "stream_event", event: { type: "message_start", message: { id: "msg_r", usage: { input_tokens: 3 } } } },
+    { type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "refusal" }, usage: { output_tokens: 0 } } },
+    { type: "stream_event", event: { type: "message_stop" } },
+    { type: "result", subtype: "success", is_error: false, result: "", stop_reason: "refusal", usage: { input_tokens: 3, output_tokens: 0 } },
+  ];
+  const runner = new ClaudeRunner(config, createLogger("error"), fakeQuery(events) as never);
+  const { response } = await runner.run({
+    conversationKey: "refusal",
+    request: request(),
+    signal: new AbortController().signal,
+    requestId: "refusal",
+    stream: false,
+  });
+  assert.equal(response.stop_reason, "refusal");
+  assert.deepEqual(response.content, []);
+});
+
+test("the CLI gets output headroom above a small client max_tokens", async () => {
+  let options: Record<string, unknown> | undefined;
+  const runner = new ClaudeRunner(
+    { ...config, minCliOutputTokens: 16_384 },
+    createLogger("error"),
+    fakeQuery(textEvents, (value) => (options = value)) as never,
+  );
+  await runner.run({
+    conversationKey: "headroom",
+    request: request({ max_tokens: 4096 }),
+    signal: new AbortController().signal,
+    requestId: "headroom",
+    stream: false,
+  });
+  const env = options?.env as Record<string, string>;
+  assert.equal(env.CLAUDE_CODE_MAX_OUTPUT_TOKENS, "16384");
+  runner.closeAll();
+});
+
+test("the thinking budget leaves room for the reply", async () => {
+  let options: Record<string, unknown> | undefined;
+  const runner = new ClaudeRunner(
+    config,
+    createLogger("error"),
+    fakeQuery(textEvents, (value) => (options = value)) as never,
+  );
+  await runner.run({
+    conversationKey: "budget",
+    request: request({
+      max_tokens: 8192,
+      thinking: { type: "enabled", budget_tokens: 8192 },
+    }),
+    signal: new AbortController().signal,
+    requestId: "budget",
+    stream: false,
+  });
+  assert.deepEqual(options?.thinking, {
+    type: "enabled",
+    budgetTokens: 7168,
+    display: "summarized",
+  });
   runner.closeAll();
 });

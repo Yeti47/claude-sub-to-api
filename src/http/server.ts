@@ -239,6 +239,8 @@ export function createHandler(deps: Deps) {
         stream,
         status: 200,
         compaction: compacting || undefined,
+        stop_reason: result.response.stop_reason,
+        blocks: result.response.content.map((block) => block.type).join(",") || "none",
         resumed: Boolean(result.resumed),
         forked: Boolean(result.forked),
         reused: Boolean(result.reused),

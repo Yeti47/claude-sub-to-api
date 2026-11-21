@@ -695,15 +695,21 @@ export class ClaudeRunner {
       throw errorFor(error);
     }
     if (assembler.content.length === 0 && typeof lastMessage?.result === "string") {
-      assembler.content = [{ type: "text", text: lastMessage.result }];
+      if (lastMessage.result.trim()) {
+        assembler.content = [{ type: "text", text: lastMessage.result }];
+      }
     }
-    if (
-      assembler.content.length === 0 &&
-      assembler.stopReason !== "max_tokens" &&
-      assembler.stopReason !== "refusal"
-    ) {
+    // A reply with no text and no tool call is not an answer: agent harnesses
+    // report it as a failed turn (Copilot rejects it as an empty response).
+    // A compaction turn comes back empty by design when the turn is cut off,
+    // and a refusal is a real stop reason of its own.
+    const answered = assembler.content.some(
+      (block) =>
+        (block.type === "text" && block.text.trim() !== "") || block.type === "tool_use",
+    );
+    if (!answered && !input.noToolCalls && assembler.stopReason !== "refusal") {
       process.close("Empty response");
-      throw new ApiError(502, "api_error", "Claude Code returned an empty response");
+      throw new ApiError(502, "api_error", emptyTurnMessage(assembler));
     }
     const response = assembler.response();
     // A message that stopped on a tool call but never reached the park above
@@ -724,6 +730,20 @@ export class ClaudeRunner {
 
 /** Seconds a client turned away for lack of a free process should wait. */
 const QUEUE_RETRY_AFTER_SECONDS = 10;
+
+/** A turn that produced no answer, described so the client knows what to change. */
+function emptyTurnMessage(assembler: MessageAssembler): string {
+  const stop = assembler.stopReason ?? "end_turn";
+  if (stop === "max_tokens") {
+    const spent = assembler.usage.output_tokens;
+    return (
+      `Claude reached the output token limit (max_tokens) after ${spent} output tokens ` +
+      "before it produced any text or tool call, so the turn was cut off with nothing to " +
+      "return. Raise max_tokens or lower the thinking budget, then retry."
+    );
+  }
+  return `Claude returned no text and no tool call (stop_reason: ${stop}), so the turn was empty`;
+}
 
 /** Every tool call the request's history contains. */
 function toolUseIds(messages: MessagesRequest["messages"]): Set<string> {

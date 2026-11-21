@@ -35,6 +35,12 @@ export interface Config {
   requestTimeoutMs: number;
   /** Default output-token ceiling, matching the Anthropic API default. */
   defaultMaxTokens: number;
+  /**
+   * Lowest output ceiling the CLI is given. A Claude Code turn spends part of
+   * its ceiling on reasoning and tool-call JSON, so a client's small
+   * `max_tokens` would otherwise cut off the turn before its first text block.
+   */
+  minCliOutputTokens: number;
   /** How the upstream system prompt includes the client's instructions. */
   systemPromptMode: SystemPromptMode;
   /** Optional path for persisted conversation -> Claude session bindings. */
@@ -99,6 +105,7 @@ export function loadConfig(envVars: NodeJS.ProcessEnv = process.env): Config {
     maxConcurrency: intEnv("MAX_CONCURRENCY", 4, 1, 64),
     requestTimeoutMs: intEnv("REQUEST_TIMEOUT_MS", 15 * 60_000, 10_000, 3_600_000),
     defaultMaxTokens: intEnv("DEFAULT_MAX_TOKENS", 8192, 1, 64_000),
+    minCliOutputTokens: intEnv("MIN_CLI_OUTPUT_TOKENS", 16_384, 0, 64_000),
     systemPromptMode,
     statePath: envVars.STATE_PATH?.trim() || undefined,
     parkedTurnTtlMs: intEnv("PARKED_TURN_TTL_MS", 30 * 60_000, 0, 24 * 60 * 60_000),
