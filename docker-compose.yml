@@ -25,6 +25,9 @@ services:
       PARKED_TURN_TTL_MS: "${PARKED_TURN_TTL_MS:-1800000}"
       PARKED_EVICTABLE_AFTER_MS: "${PARKED_EVICTABLE_AFTER_MS:-60000}"
       QUEUE_TIMEOUT_MS: "${QUEUE_TIMEOUT_MS:-30000}"
+      # Headroom above a client's max_tokens; a turn also spends output tokens
+      # on reasoning and tool-call JSON.
+      MIN_CLI_OUTPUT_TOKENS: "${MIN_CLI_OUTPUT_TOKENS:-16384}"
       # A neutral, stable working directory keeps the harness context out of
       # the repository and makes the cached system prompt reusable.
       CLAUDE_CWD: "/data/workspace"

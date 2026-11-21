@@ -9,7 +9,9 @@ function thinkingOption(request: MessagesRequest, maxTokens: number): Record<str
   if (!thinking || thinking.type === "disabled") return { type: "disabled" };
   if (thinking.type === "adaptive") return { type: "adaptive", display: "summarized" };
   const budget = Number(thinking.budget_tokens ?? 0);
-  const limit = maxTokens - 1;
+  // Leave room for the reply itself: a budget that covers the whole ceiling
+  // would let reasoning consume the turn and answer with nothing.
+  const limit = maxTokens - Math.max(1, Math.min(1024, Math.floor(maxTokens / 2)));
   if (budget <= 0 || limit < 1024) return { type: "adaptive", display: "summarized" };
   return {
     type: "enabled",
@@ -102,6 +104,18 @@ function requestMaxTokens(config: Config, request: MessagesRequest): number {
   return Math.min(Math.max(1, request.max_tokens ?? config.defaultMaxTokens), 64_000);
 }
 
+/**
+ * The ceiling the CLI actually gets. The client's `max_tokens` caps the reply
+ * it asked for, but a Claude Code turn also spends output tokens on reasoning
+ * and tool-call JSON, and a harness that sets a small cap (4096, say) would
+ * otherwise cut the turn off before its first text block. The configured
+ * floor keeps such a turn alive; 1024 remains the absolute minimum.
+ */
+function cliMaxTokens(config: Config, request: MessagesRequest): number {
+  const client = requestMaxTokens(config, request);
+  return Math.min(64_000, Math.max(client, 1024, config.minCliOutputTokens));
+}
+
 export function wantsThinking(request: MessagesRequest): boolean {
   return request.thinking?.type === "enabled" || request.thinking?.type === "adaptive";
 }
@@ -121,15 +135,13 @@ export interface QueryOptionsInput {
 
 export function queryOptions(input: QueryOptionsInput): Record<string, unknown> {
   const { config, request, prepared, bridge } = input;
-  const maxTokens = requestMaxTokens(config, request);
-  // Some models reason even when thinking is off; that reasoning spends
-  // the CLI's output budget. Give short requests headroom so the answer is
-  // not cut off before it starts.
-  const cliMaxTokens = wantsThinking(request) ? maxTokens : Math.max(maxTokens, 1024);
+  // The client's cap is a lower bound for the CLI, not the CLI's ceiling: one
+  // turn may have to reason before it answers (see cliMaxTokens).
+  const maxTokens = cliMaxTokens(config, request);
 
   const options: Record<string, unknown> = {
     cwd: config.cwd,
-    env: childEnv(config, cliMaxTokens),
+    env: childEnv(config, maxTokens),
     model: request.model,
     includePartialMessages: true,
     persistSession: input.persistSession,
@@ -185,7 +197,7 @@ export function queryOptions(input: QueryOptionsInput): Record<string, unknown> 
  * whose launch key equals its own.
  */
 export function launchKey(config: Config, request: MessagesRequest, prepared: PreparedTurn): string {
-  const maxTokens = requestMaxTokens(config, request);
+  const maxTokens = cliMaxTokens(config, request);
   return stableStringify({
     model: request.model,
     system: prepared.system ?? null,
